@@ -1,638 +1,717 @@
-# bot.py
+# bot_new.py
+# Based on your uploaded bot.py and requirements. 0 1
+
 import asyncio
-import logging
 import os
+import time
+import aiosqlite
 from datetime import datetime, timezone, timedelta
 
-import asyncpg
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command, Text
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove,
+    ContentType,
+)
+from aiogram.filters import CommandStart, Command
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("predlojka_bot")
-
+# ---------- CONFIG ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-PREDLOJKA_ID = os.getenv("PREDLOJKA_ID")  # must be set
-CHANNEL_ID = os.getenv("CHANNEL_ID")      # must be set
-ADMIN_ID = os.getenv("ADMIN_ID")
-
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set")
-if not PREDLOJKA_ID:
-    raise RuntimeError("PREDLOJKA_ID is not set")
-if not CHANNEL_ID:
-    raise RuntimeError("CHANNEL_ID is not set")
+    raise RuntimeError("BOT_TOKEN environment variable is required")
 
-PREDLOJKA_ID = int(PREDLOJKA_ID)
-CHANNEL_ID = int(CHANNEL_ID)
+# IDs (set these as environment variables)
+PREDLOJKA_ID = os.getenv("PREDLOJKA_ID")  # group id for proposals (as integer string)
+CHANNEL_ID = os.getenv("CHANNEL_ID")      # channel id for accepted posts (as integer string)
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
-dp = Dispatcher()
+# Convert to ints when available, keep None otherwise
+try:
+    PREDLOJKA_ID = int(PREDLOJKA_ID) if PREDLOJKA_ID is not None else None
+except Exception:
+    PREDLOJKA_ID = None
 
-# --- DB helpers --------------------------------------------------------------
-_pool: asyncpg.Pool | None = None
+try:
+    CHANNEL_ID = int(CHANNEL_ID) if CHANNEL_ID is not None else None
+except Exception:
+    CHANNEL_ID = None
 
-async def db_connect():
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(DATABASE_URL)
-        async with _pool.acquire() as conn:
-            # create tables if not exists
-            await conn.execute("""
+DB_PATH = os.getenv("DB_PATH", "data.db")
+CHECK_UNBAN_SECONDS = 60  # background check interval
+
+# ---------- TEXTS ----------
+LANG_PROMPT_RU = "🗣️ Выберите язык"
+LANG_PROMPT_UK = "🗣️ Виберіть мову"
+
+WELCOME_RU = (
+    "👋 Добро пожаловать в бота «Сущности Горишних Плавней»!\n"
+    "Здесь Вы можете предложить пост или обратиться в поддержку канала.\n\n"
+    "🆙 Ваша репутация\n"
+    "{rep}\n\n"
+    "Репутацию можно повысить предложив пост, который в следствии будет одобрен. Чем интереснее Ваш пост, тем больше репутации вы заработаете."
+)
+
+WELCOME_UK = (
+    "👋 Ласкаво просимо до бота «Сущності Горішніх Плавнів»!\n"
+    "Тут ви можете запропонувати пост або звернутися до підтримки каналу.\n\n"
+    "🆙 Ваша репутація\n"
+    "{rep}\n\n"
+    "Репутацію можна підвищити, запропонувавши пост, який в результаті буде схвалений. Чим цікавіший Ваш пост, тим більше репутації Ви заробите."
+)
+
+PROPOSE_PROMPT_RU = (
+    "🖼️ Пришлите свой пост. Это может быть видео, картинка или надпись. Помните: пост должен соответствовать нашей политике конфиденциальности."
+)
+PROPOSE_PROMPT_UK = (
+    "🖼️ Надішліть свій пост. Це може бути відео, зображення або напис. Пам'ятайте: пост повинен відповідати нашій політиці конфіденційності."
+)
+
+CONFIRM_SENT_RU = "✅ Ваш пост отправлен на рассмотрение. Дождитесь, пока его проверят."
+CONFIRM_SENT_UK = "✅ Ваш пост відправлений на розгляд. Зачекайте, поки його перевірять."
+
+CANCEL_TEXT_RU = "❌ Отменить"
+CANCEL_TEXT_UK = "❌ Скасувати"
+
+ACCEPT_NOTICE_RU = "🆙 Ваш пост был принят! Вы заработали +{n} репутации."
+ACCEPT_NOTICE_UK = "🆙 Ваш пост був прийнятий! Ви заробили +{n} репутації."
+
+DECLINE_NOTICE_RU = "🙁 Ваш пост был отклонён."
+DECLINE_NOTICE_UK = "🙁 Ваш пост був відхилений."
+
+BANNED_NOTICE_RU = "🚫 Вы были забанены в опции предложения постов на {period}."
+BANNED_NOTICE_UK = "🚫 Ви були забанені у опції пропозиції постів на {period}."
+
+UNBANNED_NOTICE_RU = "🔓 Срок Вашего бана в опции предложения постов был окончен! Вы снова можете предлагать свои посты."
+UNBANNED_NOTICE_UK = "🔓 Термін Вашого бану в опції пропозиції постів закінчився! Ви знову можете пропонувати свої пости."
+
+# ---------- HELPERS (DB) ----------
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
+                user_id INTEGER PRIMARY KEY,
                 lang TEXT DEFAULT 'ru',
-                reputation INT DEFAULT 0,
-                in_predlojka BOOLEAN DEFAULT FALSE,
-                banned_until TIMESTAMP WITH TIME ZONE
-            );
-            CREATE TABLE IF NOT EXISTS posts (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
-                status TEXT NOT NULL DEFAULT 'pending',
-                user_message_id INT,  -- message id in user chat (to reply)
-                group_message_id INT, -- message id in mod group (first metadata message)
-                group_post_copy_message_id INT -- message id of copied post in group (if any)
-            );
-            """)
+                reputation INTEGER DEFAULT 0,
+                banned_until INTEGER DEFAULT 0,
+                in_propose INTEGER DEFAULT 0
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                user_chat_id INTEGER NOT NULL,
+                user_msg_id INTEGER NOT NULL,
+                group_header_msg_id INTEGER,
+                group_post_msg_id INTEGER,
+                group_mod_msg_id INTEGER,
+                created_at INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending'
+            )
+            """
+        )
+        await db.commit()
 
-async def db_get_user(user_id: int):
-    async with _pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+
+async def set_user_lang(user_id: int, lang: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO users (user_id, lang) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET lang = excluded.lang",
+            (user_id, lang),
+        )
+        await db.commit()
+
+
+async def get_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, lang, reputation, banned_until, in_propose FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
         return row
 
-async def db_ensure_user(user_id: int):
-    async with _pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (user_id) VALUES ($1)
-            ON CONFLICT (user_id) DO NOTHING
-        """, user_id)
-        row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
-        return row
 
-async def db_set_lang(user_id: int, lang: str):
-    async with _pool.acquire() as conn:
-        await conn.execute("UPDATE users SET lang=$1 WHERE user_id=$2", lang, user_id)
+async def ensure_user_row(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+        await db.commit()
 
-async def db_set_in_predlojka(user_id: int, value: bool):
-    async with _pool.acquire() as conn:
-        await conn.execute("UPDATE users SET in_predlojka=$1 WHERE user_id=$2", value, user_id)
 
-async def db_set_ban(user_id: int, until_ts):
-    async with _pool.acquire() as conn:
-        await conn.execute("UPDATE users SET banned_until=$1 WHERE user_id=$2", until_ts, user_id)
+async def set_in_propose(user_id: int, value: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET in_propose = ? WHERE user_id = ?", (1 if value else 0, user_id))
+        await db.commit()
 
-async def db_add_reputation(user_id: int, amount: int):
-    async with _pool.acquire() as conn:
-        await conn.execute("UPDATE users SET reputation = reputation + $1 WHERE user_id=$2", amount, user_id)
-        row = await conn.fetchrow("SELECT reputation FROM users WHERE user_id=$1", user_id)
-        return row['reputation']
 
-async def db_create_post(user_id: int, user_message_id: int):
-    async with _pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            INSERT INTO posts (user_id, user_message_id) VALUES ($1, $2)
-            RETURNING id, created_at
-        """, user_id, user_message_id)
-        return row
+async def set_banned_until(user_id: int, until_ts: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET banned_until = ? WHERE user_id = ?", (until_ts, user_id))
+        await db.commit()
 
-async def db_set_post_group_message(post_id: int, group_msg_id: int, group_post_copy_message_id: int | None = None):
-    async with _pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE posts SET group_message_id=$1, group_post_copy_message_id=$2 WHERE id=$3
-        """, group_msg_id, group_post_copy_message_id, post_id)
 
-async def db_set_post_status(post_id: int, status: str):
-    async with _pool.acquire() as conn:
-        await conn.execute("UPDATE posts SET status=$1 WHERE id=$2", status, post_id)
+async def add_reputation(user_id: int, delta: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET reputation = reputation + ? WHERE user_id = ?", (delta, user_id))
+        await db.commit()
 
-async def db_get_post(post_id: int):
-    async with _pool.acquire() as conn:
-        return await conn.fetchrow("SELECT * FROM posts WHERE id=$1", post_id)
 
-# --- Utilities ---------------------------------------------------------------
-RU_MONTHS = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"]
-UK_MONTHS = ["січня","лютого","березня","квітня","травня","червня","липня","серпня","вересня","жовтня","листопада","грудня"]
+async def get_reputation(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT reputation FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row else 0
 
-def format_time_and_date(dt: datetime, lang: str):
-    dt_local = dt.astimezone(timezone.utc).replace(tzinfo=timezone.utc)  # store as UTC
-    hhmm = dt_local.strftime("%H:%M")
-    day = dt_local.day
-    mname = RU_MONTHS[dt_local.month - 1] if lang == "ru" else UK_MONTHS[dt_local.month - 1]
-    date_text = f"{day} {mname}"
-    return hhmm, date_text
 
-def mention_for_user(user: types.User):
-    if user.username:
-        return f"@{user.username}"
-    else:
-        # HTML mention by id
-        return f'<a href="tg://user?id={user.id}">{(user.full_name or "User")}</a>'
+async def create_proposal_entry(user_id: int, user_chat_id: int, user_msg_id: int) -> int:
+    ts = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT INTO proposals (user_id, user_chat_id, user_msg_id, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, user_chat_id, user_msg_id, ts),
+        )
+        await db.commit()
+        return cur.lastrowid
 
-def human_timedelta_seconds(seconds: int, lang: str):
-    # format as "0д, 0ч, 0м"
-    d = seconds // 86400
-    h = (seconds % 86400) // 3600
-    m = (seconds % 3600) // 60
-    return f"{d}д, {h}ч, {m}м"
 
-# --- Keyboards ---------------------------------------------------------------
-def lang_choice_kb():
+async def update_proposal_ids(proposal_id: int, header_msg_id: int = None, post_msg_id: int = None, mod_msg_id: int = None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        q = "UPDATE proposals SET "
+        parts = []
+        args = []
+        if header_msg_id is not None:
+            parts.append("group_header_msg_id = ?")
+            args.append(header_msg_id)
+        if post_msg_id is not None:
+            parts.append("group_post_msg_id = ?")
+            args.append(post_msg_id)
+        if mod_msg_id is not None:
+            parts.append("group_mod_msg_id = ?")
+            args.append(mod_msg_id)
+        if not parts:
+            return
+        q += ", ".join(parts) + " WHERE id = ?"
+        args.append(proposal_id)
+        await db.execute(q, tuple(args))
+        await db.commit()
+
+
+async def get_proposal(proposal_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id, user_id, user_chat_id, user_msg_id, group_mod_msg_id, status FROM proposals WHERE id = ?", (proposal_id,))
+        return await cur.fetchone()
+
+
+async def set_proposal_status(proposal_id: int, status: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE proposals SET status = ? WHERE id = ?", (status, proposal_id))
+        await db.commit()
+
+
+# ---------- UTIL ----------
+
+def make_lang_kb():
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇷🇺 RU", callback_data="setlang:ru"),
-         InlineKeyboardButton(text="🇺🇦 UK", callback_data="setlang:uk")]
+        [InlineKeyboardButton(text="🇷🇺 RU", callback_data="set_lang:ru"),
+         InlineKeyboardButton(text="🇺🇦 UK", callback_data="set_lang:uk")]
     ])
     return kb
 
+
 def main_menu_kb(lang: str):
     if lang == "uk":
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton("🖼️ Запропонувати пост", callback_data="menu:predlojka")],
-            [InlineKeyboardButton("📩 Підтримка", callback_data="menu:support")],
-            [InlineKeyboardButton("🗣️ Змінити мову", callback_data="menu:lang")],
-            [InlineKeyboardButton("📋 Політика конфіденційності", callback_data="menu:privacy")]
-        ])
+        text_propose = "🖼️ Запропонувати пост"
+        text_support = "📩 Підтримка"
+        text_lang = "🗣️ Змінити мову"
+        text_privacy = "📋 Політика конфіденційності"
     else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton("🖼️ Предложить пост", callback_data="menu:predlojka")],
-            [InlineKeyboardButton("📩 Поддержка", callback_data="menu:support")],
-            [InlineKeyboardButton("🗣️ Сменить язык", callback_data="menu:lang")],
-            [InlineKeyboardButton("📋 Политика конфиденциальности", callback_data="menu:privacy")]
-        ])
+        text_propose = "🖼️ Предложить пост"
+        text_support = "📩 Поддержка"
+        text_lang = "🗣️ Сменить язык"
+        text_privacy = "📋 Политика конфиденциальности"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=text_propose, callback_data="main:propose")],
+        [InlineKeyboardButton(text=text_support, callback_data="main:support")],
+        [InlineKeyboardButton(text=text_lang, callback_data="main:lang")],
+        [InlineKeyboardButton(text=text_privacy, callback_data="main:privacy")],
+    ])
     return kb
 
+
 def cancel_kb(lang: str):
-    text = "❌ Скасувати" if lang == "uk" else "❌ Отменить"
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text, callback_data="predlojka:cancel")]])
+    txt = CANCEL_TEXT_UK if lang == "uk" else CANCEL_TEXT_RU
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=txt, callback_data="propose:cancel")]
+    ])
+    return kb
 
-def group_moderation_kb(post_id: int, lang: str):
-    # for pending posts
-    if lang == "uk":
-        buttons = [
-            [InlineKeyboardButton("✅ Прийняти", callback_data=f"mod:accept:{post_id}"),
-             InlineKeyboardButton("❌ Відхилити", callback_data=f"mod:reject:{post_id}")],
-            [InlineKeyboardButton("🚫 Бан користувача", callback_data=f"mod:banmenu:{post_id}")]
+
+def mod_buttons(proposal_id: int):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"mod:accept:{proposal_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod:decline:{proposal_id}"),
+            InlineKeyboardButton(text="🚫 Бан пользователя", callback_data=f"mod:ban:{proposal_id}"),
         ]
+    ])
+    return kb
+
+
+def ban_duration_kb(proposal_id: int):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 12 часов", callback_data=f"ban:12h:{proposal_id}")],
+        [InlineKeyboardButton(text="🚫 24 часов", callback_data=f"ban:24h:{proposal_id}")],
+        [InlineKeyboardButton(text="🚫 3 дня", callback_data=f"ban:3d:{proposal_id}")],
+        [InlineKeyboardButton(text="🚫 1 неделя", callback_data=f"ban:7d:{proposal_id}")],
+        [InlineKeyboardButton(text="🚫 Навсегда", callback_data=f"ban:forever:{proposal_id}")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"ban:back:{proposal_id}")],
+    ])
+    return kb
+
+
+def rep_buttons(proposal_id: int):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🆙 +3 репутации", callback_data=f"rep:3:{proposal_id}"),
+            InlineKeyboardButton(text="🆙 +2 репутации", callback_data=f"rep:2:{proposal_id}"),
+            InlineKeyboardButton(text="🆙 +1 репутация", callback_data=f"rep:1:{proposal_id}"),
+        ]
+    ])
+    return kb
+
+
+def format_remaining(ts_end: int) -> str:
+    if ts_end <= 0:
+        return "0д, 0ч, 0м"
+    rem = ts_end - int(time.time())
+    if rem <= 0:
+        return "0д, 0ч, 0м"
+    days = rem // 86400
+    hours = (rem % 86400) // 3600
+    minutes = (rem % 3600) // 60
+    return f"{days}д, {hours}ч, {minutes}м"
+
+
+def human_date(ts: int):
+    dt = datetime.fromtimestamp(ts)
+    day = dt.day
+    month_name = dt.strftime("%B")  # will be English by default; user didn't require localization
+    return f"{day} {month_name}"
+
+
+def user_mention_html(user: types.User):
+    if user.username:
+        return f"@{user.username}"
     else:
-        buttons = [
-            [InlineKeyboardButton("✅ Принять", callback_data=f"mod:accept:{post_id}"),
-             InlineKeyboardButton("❌Отклонить", callback_data=f"mod:reject:{post_id}")],
-            [InlineKeyboardButton("🚫 Бан пользователя", callback_data=f"mod:banmenu:{post_id}")]
-        ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        # mention by link
+        full_name = (user.full_name or str(user.id))
+        return f'<a href="tg://user?id={user.id}">{full_name}</a>'
 
-def group_ban_options_kb(post_id: int, lang: str):
-    if lang == "uk":
-        buttons = [
-            [InlineKeyboardButton("🚫 12 год", callback_data=f"mod:ban:12h:{post_id}"),
-             InlineKeyboardButton("🚫 24 год", callback_data=f"mod:ban:24h:{post_id}")],
-            [InlineKeyboardButton("🚫 3 дні", callback_data=f"mod:ban:3d:{post_id}"),
-             InlineKeyboardButton("🚫 1 тиждень", callback_data=f"mod:ban:7d:{post_id}")],
-            [InlineKeyboardButton("🚫 Назавжди", callback_data=f"mod:ban:perm:{post_id}"),
-             InlineKeyboardButton("◀️ Назад", callback_data=f"mod:back:{post_id}")]
-        ]
-    else:
-        buttons = [
-            [InlineKeyboardButton("🚫 12 часов", callback_data=f"mod:ban:12h:{post_id}"),
-             InlineKeyboardButton("🚫 24 часов", callback_data=f"mod:ban:24h:{post_id}")],
-            [InlineKeyboardButton("🚫 3 дня", callback_data=f"mod:ban:3d:{post_id}"),
-             InlineKeyboardButton("🚫 1 неделя", callback_data=f"mod:ban:7d:{post_id}")],
-            [InlineKeyboardButton("🚫 Навсегда", callback_data=f"mod:ban:perm:{post_id}"),
-             InlineKeyboardButton("◀️ Назад", callback_data=f"mod:back:{post_id}")]
-        ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def reputation_kb(post_id: int, lang: str):
-    # after accepting: +3, +2, +1 buttons
-    if lang == "uk":
-        buttons = [
-            [InlineKeyboardButton("🆙 +3 репутації", callback_data=f"rep:3:{post_id}"),
-             InlineKeyboardButton("🆙 +2 репутації", callback_data=f"rep:2:{post_id}"),
-             InlineKeyboardButton("🆙 +1 репутація", callback_data=f"rep:1:{post_id}")]
-        ]
-    else:
-        buttons = [
-            [InlineKeyboardButton("🆙 +3 репутации", callback_data=f"rep:3:{post_id}"),
-             InlineKeyboardButton("🆙 +2 репутации", callback_data=f"rep:2:{post_id}"),
-             InlineKeyboardButton("🆙 +1 репутация", callback_data=f"rep:1:{post_id}")]
-        ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+# ---------- BOT SETUP ----------
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-# --- Handlers ---------------------------------------------------------------
-@dp.message(Command("start"))
+
+# ---------- HANDLERS ----------
+
+@dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await db_ensure_user(message.from_user.id)
-    # send language chooser (if later they reopen it and choose uk, the chooser itself should use ukrainian)
-    await message.answer("🗣️ Выберите язык", reply_markup=lang_choice_kb())
+    user = message.from_user
+    await ensure_user_row(user.id)
+    # Default prompt is Russian unless user's lang is uk
+    row = await get_user(user.id)
+    lang = "uk" if (row and row[1] == "uk") else "ru"
+    prompt = LANG_PROMPT_UK if lang == "uk" else LANG_PROMPT_RU
+    await message.answer(prompt, reply_markup=make_lang_kb())
 
-@dp.callback_query(Text(startswith="setlang:"))
-async def cb_set_lang(c: CallbackQuery):
-    await db_ensure_user(c.from_user.id)
-    _, lang = c.data.split(":", 1)
-    await db_set_lang(c.from_user.id, lang)
-    # delete language selection message
+
+@dp.callback_query(F.data and F.data.startswith("set_lang:"))
+async def cb_set_lang(call: types.CallbackQuery):
+    await call.answer()
+    lang = call.data.split(":", 1)[1]
+    user_id = call.from_user.id
+    await ensure_user_row(user_id)
+    await set_user_lang(user_id, lang)
+    # delete the language selection message
     try:
-        await c.message.delete()
+        await call.message.delete()
     except Exception:
         pass
 
     # send welcome message in chosen language
-    user_row = await db_get_user(c.from_user.id)
-    reputation = user_row['reputation'] if user_row else 0
+    rep = await get_reputation(user_id)
     if lang == "uk":
-        text = (
-            "👋 Ласкаво просимо до бота «Сущности Горишних Плавней»!\n"
-            "Тут ви можете запропонувати пост або звернутися до підтримки каналу.\n\n"
-            "🆙 Ваша репутація\n"
-            f"{reputation}\n\n"
-            "Репутацію можна підвищити, запропонувавши пост, який в результаті буде схвалений. Чим цікавіший Ваш пост, тим більше репутації Ви заробите."
-        )
+        text = WELCOME_UK.format(rep=rep)
     else:
-        text = (
-            "👋 Добро пожаловать в бота «Сущности Горишних Плавней»!\n"
-            "Здесь Вы можете предложить пост или обратиться в поддержку канала.\n\n"
-            "🆙 Ваша репутация\n"
-            f"{reputation}\n\n"
-            "Репутацию можно повысить предложив пост, который в следствии будет одобрен. Чем интереснее Ваш пост, тем больше репутации вы заработаете."
-        )
-    await c.message.answer(text, reply_markup=main_menu_kb(lang))
+        text = WELCOME_RU.format(rep=rep)
 
-@dp.callback_query(Text(startswith="menu:"))
-async def cb_menu(c: CallbackQuery):
-    action = c.data.split(":", 1)[1]
-    user = c.from_user
-    await db_ensure_user(user.id)
-    user_row = await db_get_user(user.id)
-    lang = user_row['lang'] if user_row else 'ru'
+    await call.message.answer(text, reply_markup=main_menu_kb(lang))
 
-    if action == "predlojka":
-        # check ban
-        now = datetime.now(timezone.utc)
-        ban_until = user_row['banned_until']
-        if ban_until and ban_until > now:
-            secs = int((ban_until - now).total_seconds())
-            text = f"🚫 Ви забанені у пропозиціях на {human_timedelta_seconds(secs, lang)}" if lang == "uk" else f"🚫 Вы забанены в предложках на {human_timedelta_seconds(secs, lang)}"
-            await c.answer(text, show_alert=True)
-            return
-        # set in_predlojka true and ask for post
-        await db_set_in_predlojka(user.id, True)
-        if lang == "uk":
-            await c.message.answer("🖼️ Надішліть свій пост. Це може бути відео, зображення або напис. Пам'ятайте: пост повинен відповідати нашій політиці конфіденційності.", reply_markup=cancel_kb(lang))
-        else:
-            await c.message.answer("🖼️ Пришлите свой пост. Это может быть видео, картинка или надпись. Помните: пост должен соответствовать нашей политикой конфиденциальности.", reply_markup=cancel_kb(lang))
-    elif action == "support":
-        # Not implemented (as requested keep others without functionality)
-        await c.answer("В разработке...", show_alert=True)
-    elif action == "lang":
-        await c.message.answer("🗣️ Выберите язык", reply_markup=lang_choice_kb())
-    elif action == "privacy":
-        await c.answer("Политика конфиденциальности — в разработке...", show_alert=True)
 
-@dp.callback_query(Text(startswith="predlojka:cancel"))
-async def cb_predlojka_cancel(c: CallbackQuery):
-    user_id = c.from_user.id
-    await db_set_in_predlojka(user_id, False)
-    user_row = await db_get_user(user_id)
-    lang = user_row['lang'] if user_row else 'ru'
-    # delete cancel message
+@dp.callback_query(F.data == "main:lang")
+async def cb_main_change_lang(call: types.CallbackQuery):
+    await call.answer()
+    # show language selector; but if user selected Ukrainian earlier, show Ukrainian prompt text
+    row = await get_user(call.from_user.id)
+    lang = "uk" if (row and row[1] == "uk") else "ru"
+    prompt = LANG_PROMPT_UK if lang == "uk" else LANG_PROMPT_RU
+    await call.message.answer(prompt, reply_markup=make_lang_kb())
+
+
+@dp.callback_query(F.data == "main:propose")
+async def cb_main_propose(call: types.CallbackQuery):
+    await call.answer()
+    user_id = call.from_user.id
+    await ensure_user_row(user_id)
+    row = await get_user(user_id)
+    lang = "uk" if (row and row[1] == "uk") else "ru"
+    banned_until = row[3] if row else 0
+    now = int(time.time())
+    if banned_until and banned_until > now:
+        rem = format_remaining(banned_until)
+        text = BANNED_NOTICE_UK.format(period=rem) if lang == "uk" else BANNED_NOTICE_RU.format(period=rem)
+        await call.message.answer(text)
+        return
+    # set user into propose mode and prompt
+    await set_in_propose(user_id, True)
+    prompt = PROPOSE_PROMPT_UK if lang == "uk" else PROPOSE_PROMPT_RU
+    await call.message.answer(prompt, reply_markup=cancel_kb(lang))
+
+
+@dp.callback_query(F.data == "propose:cancel")
+async def cb_propose_cancel(call: types.CallbackQuery):
+    await call.answer()
+    user_id = call.from_user.id
+    await set_in_propose(user_id, False)
+    row = await get_user(user_id)
+    lang = "uk" if (row and row[1] == "uk") else "ru"
+    rep = await get_reputation(user_id)
+    text = WELCOME_UK.format(rep=rep) if lang == "uk" else WELCOME_RU.format(rep=rep)
     try:
-        await c.message.delete()
+        await call.message.delete()
     except Exception:
         pass
-    # send main menu again
-    reputation = user_row['reputation'] if user_row else 0
-    if lang == "uk":
-        text = (
-            "👋 Ласкаво просимо до бота «Сущности Горишних Плавней»!\n"
-            "Тут ви можете запропонувати пост або звернутися до підтримки каналу.\n\n"
-            "🆙 Ваша репутація\n"
-            f"{reputation}\n\n"
-            "Репутацію можна підвищити, запропонувавши пост, який в результаті буде схвалений. Чим цікавіший Ваш пост, тим більше репутації Ви заробите."
-        )
-    else:
-        text = (
-            "👋 Добро пожаловать в бота «Сущности Горишних Плавней»!\n"
-            "Здесь Вы можете предложить пост или обратиться в поддержку канала.\n\n"
-            "🆙 Ваша репутация\n"
-            f"{reputation}\n\n"
-            "Репутацию можно повысить предложив пост, который в следствии будет одобрен. Чем интереснее Ваш пост, тем больше репутации вы заработаете."
-        )
-    await c.message.answer(text, reply_markup=main_menu_kb(lang))
+    await call.message.answer(text, reply_markup=main_menu_kb(lang))
 
+
+# while in propose mode: treat any incoming content as a post
 @dp.message()
-async def catch_predlojka_message(message: types.Message):
-    # If user is in predlojka mode, treat any incoming message as the post
-    await db_ensure_user(message.from_user.id)
-    user_row = await db_get_user(message.from_user.id)
-    if not user_row:
-        return
-    if not user_row['in_predlojka']:
-        return  # ignore (no other functionality requested)
-
-    # check ban again (safety)
-    now = datetime.now(timezone.utc)
-    ban_until = user_row['banned_until']
-    lang = user_row['lang'] or 'ru'
-    if ban_until and ban_until > now:
-        secs = int((ban_until - now).total_seconds())
-        await message.answer(("🚫 Ви забанені у пропозиціях на " + human_timedelta_seconds(secs,lang)) if lang=="uk" else ("🚫 Вы забанены в предложках на " + human_timedelta_seconds(secs,lang)))
-        await db_set_in_predlojka(message.from_user.id, False)
+async def handle_any_message(message: types.Message):
+    user = message.from_user
+    uid = user.id
+    # ensure user exists
+    await ensure_user_row(uid)
+    row = await get_user(uid)
+    in_propose = bool(row[4]) if row else False
+    if not in_propose:
+        # ignore other messages (for simplicity) or you can respond with main menu
         return
 
-    # Save post row
-    post_row = await db_create_post(message.from_user.id, message.message_id)
-    post_id = post_row['id']
-    created_at = post_row['created_at']
+    # user is in propose mode: check ban again
+    banned_until = row[3] if row else 0
+    now = int(time.time())
+    lang = "uk" if (row and row[1] == "uk") else "ru"
+    if banned_until and banned_until > now:
+        rem = format_remaining(banned_until)
+        text = BANNED_NOTICE_UK.format(period=rem) if lang == "uk" else BANNED_NOTICE_RU.format(period=rem)
+        await message.reply(text)
+        await set_in_propose(uid, False)
+        return
 
-    # prepare metadata message
-    hhmm, date_text = format_time_and_date(created_at, lang)
-    author_mention = mention_for_user(message.from_user)
-    meta = f"От {author_mention} • {hhmm} • {date_text}"
+    # create proposal record
+    proposal_id = await create_proposal_entry(uid, message.chat.id, message.message_id)
 
-    # prepare appended links text
-    links_line = (
+    # header: "От <username> • 00:00 • 1 апреля"
+    try:
+        post_ts = int(time.time())
+        hhmm = datetime.fromtimestamp(post_ts).strftime("%H:%M")
+        human = human_date(post_ts)
+        mention = await bot.get_chat(message.from_user.id)
+        mention_text = user_mention_html(mention) if mention else f"{message.from_user.id}"
+        header_text = f"От {mention_text} • {hhmm} • {human}"
+    except Exception:
+        header_text = f"От {message.from_user.id} • {datetime.now().strftime('%H:%M')} • {human_date(int(time.time()))}"
+
+    # send header to group (if configured)
+    header_msg_id = None
+    post_copy_msg_id = None
+    mod_msg_id = None
+
+    if PREDLOJKA_ID is None:
+        # If group not set, just notify user and return
+        await message.reply("PREDLOJKA_ID not configured in environment. Обратитесь к администратору.")
+        await set_in_propose(uid, False)
+        return
+
+    try:
+        header = await bot.send_message(PREDLOJKA_ID, header_text, parse_mode="HTML")
+        header_msg_id = header.message_id
+    except Exception:
+        header_msg_id = None
+
+    # copy the user's message to group (this preserves media)
+    try:
+        copied = await bot.copy_message(chat_id=PREDLOJKA_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+        post_copy_msg_id = copied.message_id
+    except Exception:
+        # fallback: try to forward
+        try:
+            fwd = await bot.forward_message(chat_id=PREDLOJKA_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+            post_copy_msg_id = fwd.message_id
+        except Exception:
+            post_copy_msg_id = None
+
+    # send appended links + moderation buttons (in the same group)
+    # The appended text must contain the 3 links per spec
+    appended_text = (
         '<a href="https://t.me/predlojka_gp_bot">Предложить пост</a>  •  '
         '<a href="https://t.me/comments_gp_plavni">Чат</a>  •  '
         '<a href="https://t.me/boost/channel_gp_plavni">Буст</a>'
     )
-
-    # Send metadata message to group
-    mod_kb = group_moderation_kb(post_id, lang)
-    group_meta = await bot.send_message(PREDLOJKA_ID, meta, reply_markup=mod_kb)
-    group_post_copy_message_id = None
-
-    # Attempt to copy the user's message into the group, trying to add the links to caption/text if possible.
     try:
-        # for media groups (albums), messages in same media_group_id will have separate entries;
-        # we'll simply forward/copy this single message and then (if necessary) send the links as separate message.
-        # Use copy_message to preserve author and media (and allow new caption)
-        original_text = message.caption or message.text or ""
-        new_caption = (original_text + "\n\n" + links_line).strip()
-        copied = await bot.copy_message(chat_id=PREDLOJKA_ID, from_chat_id=message.chat.id, message_id=message.message_id, caption=new_caption)
-        group_post_copy_message_id = copied.message_id
-    except Exception as e:
-        # fallback: forward original and then send links as separate message
+        mod_msg = await bot.send_message(PREDLOJKA_ID, appended_text, parse_mode="HTML", reply_markup=mod_buttons(proposal_id))
+        mod_msg_id = mod_msg.message_id
+    except Exception:
+        mod_msg_id = None
+
+    # update proposal record with group message ids
+    await update_proposal_ids(proposal_id, header_msg_id=header_msg_id, post_msg_id=post_copy_msg_id, mod_msg_id=mod_msg_id)
+
+    # reply to user that their post is submitted
+    confirm_text = CONFIRM_SENT_UK if lang == "uk" else CONFIRM_SENT_RU
+    try:
+        await message.reply(confirm_text)
+    except Exception:
         try:
-            await bot.forward_message(PREDLOJKA_ID, from_chat_id=message.chat.id, message_id=message.message_id)
-            await bot.send_message(PREDLOJKA_ID, links_line)
-        except Exception as ee:
-            log.exception("Failed to forward/copy user post to group: %s %s", e, ee)
+            await bot.send_message(uid, confirm_text)
+        except Exception:
+            pass
 
-    # record group message ids
-    await db_set_post_group_message(post_id, group_meta.message_id if group_meta else None, group_post_copy_message_id)
+    # exit propose mode for user
+    await set_in_propose(uid, False)
 
-    # Respond to user that post is submitted
-    if lang == "uk":
-        await message.answer("✅ Ваш пост відправлений на розгляд. Зачекайте, поки його перевірять.")
-    else:
-        await message.answer("✅ Ваш пост отправлен на рассмотрение. Дождитесь, пока его проверят.")
-
-    # exit predlojka mode for user
-    await db_set_in_predlojka(message.from_user.id, False)
-
-    # after 1 second, send main menu again
+    # after 1 second, send the main menu to the user again
     await asyncio.sleep(1)
-    reputation = user_row['reputation'] or 0
-    if lang == "uk":
-        text = (
-            "👋 Ласкаво просимо до бота «Сущности Горишних Плавней»!\n"
-            "Тут ви можете запропонувати пост або звернутися до підтримки каналу.\n\n"
-            "🆙 Ваша репутація\n"
-            f"{reputation}\n\n"
-            "Репутацію можна підвищити, запропонувавши пост, який в результаті буде схвалений. Чим цікавіший Ваш пост, тим більше репутації Ви заробите."
-        )
-    else:
-        text = (
-            "👋 Добро пожаловать в бота «Сущности Горишних Плавней»!\n"
-            "Здесь Вы можете предложить пост или обратиться в поддержку канала.\n\n"
-            "🆙 Ваша репутация\n"
-            f"{reputation}\n\n"
-            "Репутацию можно повысить предложив пост, который в следствии будет одобрен. Чем интереснее Ваш пост, тем больше репутации вы заработаете."
-        )
-    await message.answer(text, reply_markup=main_menu_kb(lang))
+    rep = await get_reputation(uid)
+    welcome = WELCOME_UK.format(rep=rep) if lang == "uk" else WELCOME_RU.format(rep=rep)
+    try:
+        await bot.send_message(uid, welcome, reply_markup=main_menu_kb(lang))
+    except Exception:
+        pass
 
-# --- Moderation callbacks in group ------------------------------------------
-@dp.callback_query(Text(startswith="mod:"))
-async def cb_mod_actions(c: CallbackQuery):
-    parts = c.data.split(":")
+
+# ---------- Moderation callbacks in PREDLOJKA group ----------
+
+@dp.callback_query(F.data and F.data.startswith("mod:"))
+async def cb_mod_actions(call: types.CallbackQuery):
+    await call.answer()
+    parts = call.data.split(":")
     action = parts[1]
-    # actions: accept, reject, banmenu, ban:<duration>, back
+    proposal_id = int(parts[2]) if len(parts) > 2 else None
+    if not proposal_id:
+        await call.message.answer("Неверные данные.")
+        return
+
+    prop = await get_proposal(proposal_id)
+    if not prop:
+        await call.message.answer("Заявка не найдена.")
+        return
+
+    # prop fields: id, user_id, user_chat_id, user_msg_id, group_mod_msg_id, status
+    user_id = prop[1]
+    user_chat_id = prop[2]
+    user_msg_id = prop[3]
+    mod_msg_id = prop[4]
+
+    # Accept
     if action == "accept":
-        post_id = int(parts[2])
-        await handle_accept(c, post_id)
-    elif action == "reject":
-        post_id = int(parts[2])
-        await handle_reject(c, post_id)
-    elif action == "banmenu":
-        post_id = int(parts[2])
-        # fetch post to determine language by post author
-        post = await db_get_post(post_id)
-        if not post:
-            await c.answer("Post not found", show_alert=True)
-            return
-        user_row = await db_get_user(post['user_id'])
-        lang = user_row['lang'] if user_row else 'ru'
-        await c.message.edit_reply_markup(reply_markup=group_ban_options_kb(post_id, lang))
-    elif action == "back":
-        post_id = int(parts[2])
-        post = await db_get_post(post_id)
-        user_row = await db_get_user(post['user_id'])
-        lang = user_row['lang'] if user_row else 'ru'
-        await c.message.edit_reply_markup(reply_markup=group_moderation_kb(post_id, lang))
-    elif action == "ban":
-        duration = parts[2]
-        post_id = int(parts[3])
-        await handle_ban_action(c, post_id, duration)
-    # answer callback to avoid 'clock'
-    await c.answer()
-
-async def handle_accept(cq: CallbackQuery, post_id: int):
-    post = await db_get_post(post_id)
-    if not post:
-        await cq.answer("Пост не найден", show_alert=True)
+        # copy the original post to the CHANNEL_ID if configured
+        if CHANNEL_ID:
+            try:
+                # copy the user's original message to the channel as final post
+                await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=user_chat_id, message_id=user_msg_id)
+            except Exception:
+                pass
+        # set proposal status
+        await set_proposal_status(proposal_id, "accepted")
+        # edit moderation message to reputation buttons
+        try:
+            await bot.edit_message_text(call.message.text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=rep_buttons(proposal_id), parse_mode="HTML")
+        except Exception:
+            pass
         return
-    if post['status'] != 'pending':
-        await cq.answer("Уже обработан", show_alert=True)
+
+    # Decline
+    if action == "decline":
+        await set_proposal_status(proposal_id, "declined")
+        # notify author in reply to their message in bot chat
+        # choose language of user
+        urow = await get_user(user_id)
+        lang = "uk" if (urow and urow[1] == "uk") else "ru"
+        text = DECLINE_NOTICE_UK if lang == "uk" else DECLINE_NOTICE_RU
+        try:
+            await bot.send_message(user_chat_id, text, reply_to_message_id=user_msg_id)
+        except Exception:
+            try:
+                await bot.send_message(user_chat_id, text)
+            except Exception:
+                pass
+        # remove moderation buttons / mark status
+        try:
+            await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
         return
-    # copy the post to channel
-    try:
-        # If we have stored group_post_copy_message_id we can forward/copy that msg to channel
-        if post['group_post_copy_message_id']:
-            await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=post['group_post_copy_message_id'])
-        else:
-            # fallback: copy the user message from the user's chat if we have user_message_id
-            await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=post['user_id'], message_id=post['user_message_id'])
-    except Exception as e:
-        log.exception("Failed to copy to channel: %s", e)
 
-    # mark accepted
-    await db_set_post_status(post_id, "accepted")
-
-    # edit mod message buttons in group to reputation options
-    user_row = await db_get_user(post['user_id'])
-    lang = user_row['lang'] if user_row else 'ru'
-    try:
-        # switch the buttons of the moderation meta message to reputation options
-        await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=post['group_message_id'], reply_markup=reputation_kb(post_id, lang))
-    except Exception:
-        pass
-
-async def handle_reject(cq: CallbackQuery, post_id: int):
-    post = await db_get_post(post_id)
-    if not post:
-        await cq.answer("Пост не найден", show_alert=True)
+    # Ban: show durations keyboard
+    if action == "ban":
+        try:
+            await bot.edit_message_text(call.message.text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=ban_duration_kb(proposal_id), parse_mode="HTML")
+        except Exception:
+            pass
         return
-    if post['status'] != 'pending':
-        await cq.answer("Уже обработан", show_alert=True)
-        return
-    await db_set_post_status(post_id, "rejected")
-    # notify author in bot chat, in reply to their original message (if still exists)
-    try:
-        user_id = post['user_id']
-        user_msg_id = post['user_message_id']
-        user_row = await db_get_user(user_id)
-        lang = user_row['lang'] if user_row else 'ru'
-        text = "🙁 Ваш пост був відхилен" if lang=="uk" else "🙁 Ваш пост был отклонён."
-        # try reply to the original message in the bot chat
-        await bot.send_message(chat_id=user_id, text=text, reply_to_message_id=user_msg_id)
-    except Exception:
-        pass
-    # edit mod message to remove buttons
-    try:
-        await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=post['group_message_id'], reply_markup=None)
-    except Exception:
-        pass
 
-async def handle_ban_action(cq: CallbackQuery, post_id: int, duration_key: str):
-    post = await db_get_post(post_id)
-    if not post:
-        await cq.answer("Пост не найден", show_alert=True)
-        return
-    user_id = post['user_id']
-    user_row = await db_get_user(user_id)
-    lang = user_row['lang'] if user_row else 'ru'
 
-    # durations mapping
-    if duration_key == "12h":
-        until = datetime.now(timezone.utc) + timedelta(hours=12)
-    elif duration_key == "24h":
-        until = datetime.now(timezone.utc) + timedelta(hours=24)
-    elif duration_key == "3d":
-        until = datetime.now(timezone.utc) + timedelta(days=3)
-    elif duration_key == "7d":
-        until = datetime.now(timezone.utc) + timedelta(days=7)
-    elif duration_key == "perm":
-        until = datetime(2100,1,1,tzinfo=timezone.utc)
+@dp.callback_query(F.data and F.data.startswith("ban:"))
+async def cb_ban_duration(call: types.CallbackQuery):
+    await call.answer()
+    parts = call.data.split(":", 2)
+    dur = parts[1]
+    proposal_id = int(parts[2]) if len(parts) > 2 else None
+    if proposal_id is None:
+        return
+    prop = await get_proposal(proposal_id)
+    if not prop:
+        return
+    user_id = prop[1]
+    user_chat_id = prop[2]
+    user_msg_id = prop[3]
+
+    if dur == "back":
+        # revert to mod buttons
+        try:
+            await bot.edit_message_text(call.message.text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=mod_buttons(proposal_id), parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    now = int(time.time())
+    if dur == "12h":
+        until = now + 12 * 3600
+    elif dur == "24h":
+        until = now + 24 * 3600
+    elif dur == "3d":
+        until = now + 3 * 24 * 3600
+    elif dur == "7d":
+        until = now + 7 * 24 * 3600
+    elif dur == "forever":
+        until = 2 ** 31 - 1  # far future
     else:
-        await cq.answer("Unknown duration", show_alert=True)
         return
 
-    await db_set_ban(user_id, until)
-    # notify in group
-    text = ("Пользователь забанен" if lang=="ru" else "Користувач забанений")
-    await cq.message.answer(f"🚫 {text} до {until.isoformat()}")
-    # send notice to user
+    # apply ban in DB
+    await set_banned_until(user_id, until)
+    await set_proposal_status(proposal_id, "banned")
+
+    # notify the user about ban (reply to their message in private chat if possible)
+    urow = await get_user(user_id)
+    lang = "uk" if (urow and urow[1] == "uk") else "ru"
+    period = format_remaining(until)
+    text = BANNED_NOTICE_UK.format(period=period) if lang == "uk" else BANNED_NOTICE_RU.format(period=period)
     try:
-        if until.year >= 2099:
-            ban_text = "🚫 Вы были забанены в опции предложения постов навсегда." if lang=="ru" else "🚫 Ви були забанені у опції пропозиції постів назавжди."
-        else:
-            secs = int((until - datetime.now(timezone.utc)).total_seconds())
-            human = human_timedelta_seconds(secs, lang)
-            ban_text = (f"🚫 Вы были забанены в опции предложения постов на {human}" if lang=="ru"
-                        else f"🚫 Ви були забанені у опції пропозиції постів на {human}")
-        await bot.send_message(chat_id=user_id, text=ban_text)
+        await bot.send_message(user_chat_id, text, reply_to_message_id=user_msg_id)
     except Exception:
-        pass
-
-    # schedule unban notification in background
-    asyncio.create_task(schedule_unban_notification(user_id, until, lang))
-
-    # edit group message back to moderation keyboard
-    try:
-        await cq.message.edit_reply_markup(reply_markup=group_moderation_kb(post_id, lang))
-    except Exception:
-        pass
-
-async def schedule_unban_notification(user_id: int, until: datetime, lang: str):
-    # If until is far in future (perm), skip scheduling
-    if until.year >= 2099:
-        return
-    now = datetime.now(timezone.utc)
-    delay = (until - now).total_seconds()
-    if delay <= 0:
-        # already expired
-        await db_set_ban(user_id, None)
         try:
-            await bot.send_message(user_id, "🔓 Срок Вашего бана в опции предложения постов был окончен! Вы снова можете предлагать свои посты." if lang=="ru" else "🔓 Термін Вашого бану в опції пропозиції постів закінчився! Ви знову можете пропонувати свої пости.")
+            await bot.send_message(user_chat_id, text)
         except Exception:
             pass
-        return
-    await asyncio.sleep(delay)
-    # unban
-    await db_set_ban(user_id, None)
+
+    # edit moderation message to reflect ban applied and clear buttons
     try:
-        await bot.send_message(user_id, "🔓 Срок Вашего бана в опции предложения постов был окончен! Вы снова можете предлагать свои посты." if lang=="ru" else "🔓 Термін Вашого бану в опції пропозиції постів закінчився! Ви знову можете пропонувати свої пости.")
+        await bot.edit_message_text(f"Пользователь забанен на {period}", chat_id=call.message.chat.id, message_id=call.message.message_id)
     except Exception:
         pass
 
-# --- Reputation callbacks ---------------------------------------------------
-@dp.callback_query(Text(startswith="rep:"))
-async def cb_rep(c: CallbackQuery):
-    _, amount_s, post_id_s = c.data.split(":")
-    amount = int(amount_s)
-    post_id = int(post_id_s)
-    post = await db_get_post(post_id)
-    if not post:
-        await c.answer("Post not found", show_alert=True)
+
+@dp.callback_query(F.data and F.data.startswith("rep:"))
+async def cb_rep_buttons(call: types.CallbackQuery):
+    await call.answer()
+    parts = call.data.split(":")
+    if len(parts) < 3:
         return
-    if post['status'] != 'accepted':
-        await c.answer("Post not accepted", show_alert=True)
+    rep_amount = int(parts[1])
+    proposal_id = int(parts[2])
+
+    prop = await get_proposal(proposal_id)
+    if not prop:
+        await call.message.answer("Заявка не найдена.")
         return
+    user_id = prop[1]
+    user_chat_id = prop[2]
+    user_msg_id = prop[3]
+
     # add reputation
-    new_rep = await db_add_reputation(post['user_id'], amount)
-    # notify author in their bot chat, in reply to their original message if possible
-    try:
-        user_row = await db_get_user(post['user_id'])
-        lang = user_row['lang'] if user_row else 'ru'
-        if lang == "uk":
-            text = f"🆙 Ваш пост був прийнятий! Ви заробили +{amount} репутації."
-        else:
-            text = f"🆙 Ваш пост был принят! Вы заработали +{amount} репутации."
-        await bot.send_message(chat_id=post['user_id'], text=text, reply_to_message_id=post['user_message_id'])
-    except Exception:
-        pass
-    # acknowledge to moderator
-    await c.answer(f"+{amount}")
+    await add_reputation(user_id, rep_amount)
+    await set_proposal_status(proposal_id, "published")
 
-# --- Startup / Shutdown -----------------------------------------------------
-async def on_startup():
-    await db_connect()
-    log.info("DB connected")
-    if ADMIN_ID:
+    # notify author with reply to their message in private chat
+    urow = await get_user(user_id)
+    lang = "uk" if (urow and urow[1] == "uk") else "ru"
+    text = (ACCEPT_NOTICE_UK if lang == "uk" else ACCEPT_NOTICE_RU).format(n=rep_amount)
+    try:
+        await bot.send_message(user_chat_id, text, reply_to_message_id=user_msg_id)
+    except Exception:
         try:
-            await bot.send_message(int(ADMIN_ID), "Бот запущен")
+            await bot.send_message(user_chat_id, text)
         except Exception:
             pass
 
-async def on_shutdown():
-    if _pool:
-        await _pool.close()
+    # remove buttons in group (or change to none)
     try:
-        await bot.session.close()
+        await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
     except Exception:
         pass
+
+
+# ---------- Background unban notifier ----------
+async def unban_watcher():
+    while True:
+        try:
+            now = int(time.time())
+            async with aiosqlite.connect(DB_PATH) as db:
+                cur = await db.execute("SELECT user_id, banned_until, lang FROM users WHERE banned_until > 0 AND banned_until <= ?", (now,))
+                rows = await cur.fetchall()
+                if rows:
+                    for r in rows:
+                        user_id = r[0]
+                        lang = r[2] or "ru"
+                        # reset ban
+                        await db.execute("UPDATE users SET banned_until = 0 WHERE user_id = ?", (user_id,))
+                        await db.commit()
+                        # notify user
+                        text = UNBANNED_NOTICE_UK if lang == "uk" else UNBANNED_NOTICE_RU
+                        try:
+                            await bot.send_message(user_id, text)
+                        except Exception:
+                            pass
+        except Exception:
+            # swallow exceptions to keep loop running
+            pass
+        await asyncio.sleep(CHECK_UNBAN_SECONDS)
+
+
+# ---------- START ----------
+async def main():
+    await init_db()
+    # start background unban watcher
+    asyncio.create_task(unban_watcher())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
+
 
 if __name__ == "__main__":
-    import asyncio
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(on_startup())
-    try:
-        dp.run_polling(bot)
-    finally:
-        loop.run_until_complete(on_shutdown())
+    asyncio.run(main())
