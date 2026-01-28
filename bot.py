@@ -6,6 +6,7 @@ import os
 import time
 import aiosqlite
 from datetime import datetime, timezone, timedelta
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import (
@@ -702,9 +703,34 @@ async def unban_watcher():
         await asyncio.sleep(CHECK_UNBAN_SECONDS)
 
 
+# ---------- Health server (PATCH) ----------
+async def start_health_server():
+    """
+    Start a minimal aiohttp server that listens on $PORT (or 8000).
+    Render expects a web process to bind to $PORT when running a Web Service.
+    """
+    port = int(os.environ.get("PORT", "8000"))
+    async def health(request):
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.add_routes([web.get('/', health)])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"[health] Listening on 0.0.0.0:{port}")
+
+
 # ---------- START ----------
 async def main():
     await init_db()
+    # start health server so Render (Web Service) sees an open port
+    # awaiting ensures server is started before polling begins
+    try:
+        await start_health_server()
+    except Exception as e:
+        print(f"[health] failed to start health server: {e}")
     # start background unban watcher
     asyncio.create_task(unban_watcher())
     try:
