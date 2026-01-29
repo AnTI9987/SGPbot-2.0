@@ -1,9 +1,5 @@
 # bot_new.py
-# Full updated file with requested features and fixes:
-# - send header (date) as first message and content+links as second message to PREDLOJKA
-# - fix info-button alert (no double call.answer)
-# - ensure group message ids are saved to DB
-#
+# Full updated file with fixes for DB path issue + previous features.
 # Requires: aiogram, aiohttp, aiosqlite
 # Env vars: BOT_TOKEN (required), PREDLOJKA_ID, CHANNEL_ID, DB_PATH (optional)
 
@@ -11,6 +7,8 @@ import asyncio
 import os
 import time
 import aiosqlite
+import sqlite3
+import sys
 from datetime import datetime
 from aiohttp import web
 from typing import Optional, Dict, Any, List
@@ -43,6 +41,10 @@ except Exception:
     CHANNEL_ID = None
 
 DB_PATH = os.getenv("DB_PATH", "data.db")
+# Normalize to absolute path to avoid ambiguity and ensure parent dir creation
+if DB_PATH != ":memory:":
+    DB_PATH = os.path.abspath(DB_PATH)
+
 CHECK_UNBAN_SECONDS = 60  # background check interval
 
 # ---------- TEXTS ----------
@@ -102,53 +104,77 @@ APPENDED_LINKS_HTML = (
     '<a href="https://t.me/boost/channel_gp_plavni">Буст</a>'
 )
 
+# ---------- Ensure DB directory exists ----------
+def ensure_db_dir():
+    """
+    Create parent directory for DB_PATH if needed.
+    """
+    if DB_PATH == ":memory:":
+        return
+    dirname = os.path.dirname(DB_PATH)
+    if not dirname:
+        return
+    try:
+        if not os.path.exists(dirname):
+            os.makedirs(dirname, exist_ok=True)
+            print(f"[db] Created DB directory: {dirname}")
+    except Exception as e:
+        print(f"[db] Failed to create DB directory {dirname}: {e}", file=sys.stderr)
+        # re-raise to stop start, because without writeable directory DB can't work
+        raise
+
 # ---------- DATABASE HELPERS ----------
 async def init_db():
     """
     Create tables and add missing columns if needed.
-    users table will store:
-      user_id (PK), lang, lang_selected (0/1), reputation, banned_until, in_propose,
-      accepted_count, declined_count
-    proposals table will store:
-      id, user_id, user_chat_id, user_msg_id, group_header_msg_id, group_post_msg_id, group_mod_msg_id,
-      created_at, status, mod_id, mod_action, mod_action_param
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        # users table (create if not exists)
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                lang TEXT DEFAULT 'ru',
-                lang_selected INTEGER DEFAULT 0,
-                reputation INTEGER DEFAULT 0,
-                banned_until INTEGER DEFAULT 0,
-                in_propose INTEGER DEFAULT 0,
-                accepted_count INTEGER DEFAULT 0,
-                declined_count INTEGER DEFAULT 0
+    # attempt to connect with a timeout; wrap in try/except to give clear error
+    try:
+        # aiosqlite will call sqlite3.connect under the hood; ensure parent dir exists beforehand
+        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
+            # users table (create if not exists)
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    lang TEXT DEFAULT 'ru',
+                    lang_selected INTEGER DEFAULT 0,
+                    reputation INTEGER DEFAULT 0,
+                    banned_until INTEGER DEFAULT 0,
+                    in_propose INTEGER DEFAULT 0,
+                    accepted_count INTEGER DEFAULT 0,
+                    declined_count INTEGER DEFAULT 0
+                )
+                """
             )
-            """
-        )
-        # proposals table
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS proposals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                user_chat_id INTEGER NOT NULL,
-                user_msg_id INTEGER NOT NULL,
-                group_header_msg_id INTEGER,
-                group_post_msg_id INTEGER,
-                group_mod_msg_id INTEGER,
-                created_at INTEGER NOT NULL,
-                status TEXT DEFAULT 'pending',
-                mod_id INTEGER,
-                mod_action TEXT,
-                mod_action_param TEXT
+            # proposals table
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS proposals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    user_chat_id INTEGER NOT NULL,
+                    user_msg_id INTEGER NOT NULL,
+                    group_header_msg_id INTEGER,
+                    group_post_msg_id INTEGER,
+                    group_mod_msg_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    status TEXT DEFAULT 'pending',
+                    mod_id INTEGER,
+                    mod_action TEXT,
+                    mod_action_param TEXT
+                )
+                """
             )
-            """
-        )
-        await db.commit()
+            await db.commit()
+            print(f"[db] Initialized DB at {DB_PATH}")
+    except sqlite3.OperationalError as e:
+        # Common cause: directory doesn't exist or permission denied
+        print(f"[db][ERROR] sqlite OperationalError while opening DB '{DB_PATH}': {e}", file=sys.stderr)
+        raise
+    except Exception as e:
+        print(f"[db][ERROR] Unexpected error while initializing DB: {e}", file=sys.stderr)
+        raise
 
 
 async def ensure_user_row(user_id: int):
@@ -283,7 +309,6 @@ async def get_proposal(proposal_id: int) -> Optional[Dict[str, Any]]:
             "mod_action_param": row[11],
         }
 
-
 # ---------- UTIL (keyboards & helpers) ----------
 def make_lang_kb():
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -405,7 +430,6 @@ dp = Dispatcher()
 
 
 # ---------- HANDLERS ----------
-
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user = message.from_user
@@ -602,7 +626,7 @@ async def handle_any_message(message: types.Message):
         await update_proposal_ids(proposal_id, header_msg_id=group_header_msg_id, post_msg_id=group_post_msg_id, mod_msg_id=group_mod_msg_id)
     except Exception:
         # log/ignore DB update error but continue flow
-        pass
+        print(f"[db][WARN] Failed to update proposal ids for {proposal_id}", file=sys.stderr)
 
     # notify user
     confirm_text = CONFIRM_SENT_UK if lang == "uk" else CONFIRM_SENT_RU
@@ -977,12 +1001,9 @@ def escape_html(text: str) -> str:
 def entities_to_html(text: str, entities: Optional[List[MessageEntity]]) -> str:
     """
     Convert message text + entities -> HTML string.
-    Supports common entity types: bold, italic, code, pre, underline, strikethrough, text_link, text_mention, url.
-    This is a conservative converter — keeps offsets and wraps substrings with tags.
     """
     if not entities:
         return escape_html(text)
-    # sort entities by offset
     ents = sorted(entities, key=lambda e: e.offset)
     parts = []
     last = 0
@@ -1019,7 +1040,6 @@ def entities_to_html(text: str, entities: Optional[List[MessageEntity]]) -> str:
             else:
                 parts.append(seg_escaped)
         else:
-            # fallback
             parts.append(seg_escaped)
         last = end
     if last < len(text):
@@ -1029,7 +1049,21 @@ def entities_to_html(text: str, entities: Optional[List[MessageEntity]]) -> str:
 
 # ---------- START ----------
 async def main():
-    await init_db()
+    # ensure DB dir exists before trying to connect
+    try:
+        ensure_db_dir()
+    except Exception as e:
+        print(f"[startup][FATAL] Cannot ensure DB directory: {e}", file=sys.stderr)
+        # stop startup with non-zero exit
+        raise
+
+    try:
+        await init_db()
+    except Exception as e:
+        print(f"[startup][FATAL] DB initialization failed: {e}", file=sys.stderr)
+        # fail startup if DB can't be initialized
+        raise
+
     # start health server so Render sees an open port
     try:
         await start_health_server()
