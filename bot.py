@@ -1,15 +1,17 @@
 # bot_new.py
-# Updated: two-message flow, disable link preview for text posts,
-# DB saving robustness, updated main menu text, and one-message-with-buttons (no extra links-only message).
-# Requires: aiogram, aiohttp, aiosqlite
-# Env vars: BOT_TOKEN (required), PREDLOJKA_ID, CHANNEL_ID, DB_PATH (optional)
+# Full updated file using asyncpg (Neon/Postgres) and fixes requested:
+# - two messages in PREDLOJKA: header (date) + content (content + links)
+# - no duplicate "links only" message
+# - disable web page preview for text posts
+# - info button shows alert correctly
+# - persistent DB on Postgres (Neon) via asyncpg
+# - updated main menu text (RU/UK)
+# Requires: aiogram, aiohttp, asyncpg
 
 import asyncio
 import os
 import time
-import aiosqlite
-import sqlite3
-import sys
+import asyncpg
 from datetime import datetime
 from aiohttp import web
 from typing import Optional, Dict, Any, List
@@ -41,14 +43,19 @@ try:
 except Exception:
     CHANNEL_ID = None
 
-DB_PATH = os.getenv("DB_PATH", "data.db")
-# normalize DB path (unless in-memory)
-if DB_PATH != ":memory:":
-    DB_PATH = os.path.abspath(DB_PATH)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    # It's allowed to run locally with a file-based sqlite or similar, but user asked Neon.
+    raise RuntimeError("DATABASE_URL environment variable is required (Neon/Postgres)")
+
+DB_POOL: Optional[asyncpg.pool.Pool] = None
 
 CHECK_UNBAN_SECONDS = 60  # background check interval
 
-# ---------- TEXTS (updated main menu per user request) ----------
+# ---------- TEXTS (updated main menu per request) ----------
+LANG_PROMPT_RU = "🗣️ Выберите язык"
+LANG_PROMPT_UK = "🗣️ Виберіть мову"
+
 WELCOME_RU = (
     "<b>👋 Добро пожаловать в бота «СГП»!</b>\n"
     "Здесь Вы можете предложить пост или обратиться в поддержку канала.\n\n"
@@ -66,9 +73,6 @@ WELCOME_UK = (
     "❌ Відхилених постів: {declined}\n\n"
     "Репутацію можна підвищити, запропонувавши пост, який в результаті буде схвалено."
 )
-
-LANG_PROMPT_RU = "🗣️ Выберите язык"
-LANG_PROMPT_UK = "🗣️ Виберіть мову"
 
 PROPOSE_PROMPT_RU = (
     "🖼️ Пришлите свой пост. Это может быть видео, картинка или надпись. Помните: пост должен соответствовать нашей политике конфиденциальности."
@@ -105,233 +109,191 @@ APPENDED_LINKS_HTML = (
     '<a href="https://t.me/boost/channel_gp_plavni">Буст</a>'
 )
 
-# ---------- DB directory helper ----------
-def ensure_db_dir():
-    if DB_PATH == ":memory:":
-        return
-    dirname = os.path.dirname(DB_PATH)
-    if not dirname:
-        return
-    if not os.path.exists(dirname):
-        try:
-            os.makedirs(dirname, exist_ok=True)
-            print(f"[db] Created DB directory: {dirname}")
-        except Exception as e:
-            print(f"[db][ERROR] Cannot create DB directory {dirname}: {e}", file=sys.stderr)
-            raise
-
-# ---------- DATABASE HELPERS (robust + explicit commits + logging) ----------
+# ---------- DATABASE HELPERS (asyncpg) ----------
 async def init_db():
-    try:
-        async with aiosqlite.connect(DB_PATH, timeout=30) as db:
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    lang TEXT DEFAULT 'ru',
-                    lang_selected INTEGER DEFAULT 0,
-                    reputation INTEGER DEFAULT 0,
-                    banned_until INTEGER DEFAULT 0,
-                    in_propose INTEGER DEFAULT 0,
-                    accepted_count INTEGER DEFAULT 0,
-                    declined_count INTEGER DEFAULT 0
-                )
-                """
-            )
-            await db.execute(
-                """
-                CREATE TABLE IF NOT EXISTS proposals (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    user_chat_id INTEGER NOT NULL,
-                    user_msg_id INTEGER NOT NULL,
-                    group_header_msg_id INTEGER,
-                    group_post_msg_id INTEGER,
-                    group_mod_msg_id INTEGER,
-                    created_at INTEGER NOT NULL,
-                    status TEXT DEFAULT 'pending',
-                    mod_id INTEGER,
-                    mod_action TEXT,
-                    mod_action_param TEXT
-                )
-                """
-            )
-            await db.commit()
-            print(f"[db] Initialized DB at {DB_PATH}")
-    except sqlite3.OperationalError as e:
-        print(f"[db][ERROR] sqlite OperationalError while opening DB '{DB_PATH}': {e}", file=sys.stderr)
-        raise
-    except Exception as e:
-        print(f"[db][ERROR] Unexpected error initializing DB: {e}", file=sys.stderr)
-        raise
+    """
+    Create tables in Postgres (Neon).
+    users:
+        user_id (PK), lang, lang_selected (boolean), reputation, banned_until, in_propose,
+        accepted_count, declined_count
+    proposals:
+        id, user_id, user_chat_id, user_msg_id, group_header_msg_id, group_post_msg_id, group_mod_msg_id,
+        created_at, status, mod_id, mod_action, mod_action_param
+    """
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+
+    create_users = """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        lang TEXT DEFAULT 'ru',
+        lang_selected BOOLEAN DEFAULT FALSE,
+        reputation INTEGER DEFAULT 0,
+        banned_until BIGINT DEFAULT 0,
+        in_propose BOOLEAN DEFAULT FALSE,
+        accepted_count INTEGER DEFAULT 0,
+        declined_count INTEGER DEFAULT 0
+    );
+    """
+
+    create_proposals = """
+    CREATE TABLE IF NOT EXISTS proposals (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL,
+        user_chat_id BIGINT NOT NULL,
+        user_msg_id BIGINT NOT NULL,
+        group_header_msg_id BIGINT,
+        group_post_msg_id BIGINT,
+        group_mod_msg_id BIGINT,
+        created_at BIGINT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        mod_id BIGINT,
+        mod_action TEXT,
+        mod_action_param TEXT
+    );
+    """
+
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(create_users)
+        await conn.execute(create_proposals)
+
 
 async def ensure_user_row(user_id: int):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-            await db.commit()
-    except Exception as e:
-        print(f"[db][ERROR] ensure_user_row({user_id}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user_id,
+        )
+
 
 async def set_user_lang(user_id: int, lang: str):
-    try:
-        # ensure row exists then update
-        await ensure_user_row(user_id)
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET lang = ?, lang_selected = 1 WHERE user_id = ?", (lang, user_id))
-            await db.commit()
-    except Exception as e:
-        print(f"[db][ERROR] set_user_lang({user_id}, {lang}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id, lang, lang_selected) VALUES ($1, $2, TRUE) "
+            "ON CONFLICT (user_id) DO UPDATE SET lang = EXCLUDED.lang, lang_selected = TRUE",
+            user_id,
+            lang,
+        )
+
 
 async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT user_id, lang, lang_selected, reputation, banned_until, in_propose, accepted_count, declined_count FROM users WHERE user_id = ?",
-                (user_id,),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return None
-            return {
-                "user_id": row[0],
-                "lang": row[1],
-                "lang_selected": bool(row[2]),
-                "reputation": row[3],
-                "banned_until": row[4],
-                "in_propose": bool(row[5]),
-                "accepted_count": row[6],
-                "declined_count": row[7],
-            }
-    except Exception as e:
-        print(f"[db][ERROR] get_user({user_id}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, lang, lang_selected, reputation, banned_until, in_propose, accepted_count, declined_count "
+            "FROM users WHERE user_id = $1",
+            user_id,
+        )
+        if not row:
+            return None
+        return {
+            "user_id": row["user_id"],
+            "lang": row["lang"],
+            "lang_selected": bool(row["lang_selected"]),
+            "reputation": row["reputation"],
+            "banned_until": row["banned_until"],
+            "in_propose": bool(row["in_propose"]),
+            "accepted_count": row["accepted_count"],
+            "declined_count": row["declined_count"],
+        }
+
 
 async def set_in_propose(user_id: int, value: bool):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET in_propose = ? WHERE user_id = ?", (1 if value else 0, user_id))
-            await db.commit()
-    except Exception as e:
-        print(f"[db][ERROR] set_in_propose({user_id}, {value}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("UPDATE users SET in_propose = $1 WHERE user_id = $2", value, user_id)
+
 
 async def set_banned_until(user_id: int, until_ts: int):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET banned_until = ? WHERE user_id = ?", (until_ts, user_id))
-            await db.commit()
-    except Exception as e:
-        print(f"[db][ERROR] set_banned_until({user_id}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("UPDATE users SET banned_until = $1 WHERE user_id = $2", until_ts, user_id)
+
 
 async def add_reputation(user_id: int, delta: int):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET reputation = reputation + ? WHERE user_id = ?", (delta, user_id))
-            await db.commit()
-    except Exception as e:
-        print(f"[db][ERROR] add_reputation({user_id}, {delta}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("UPDATE users SET reputation = reputation + $1 WHERE user_id = $2", delta, user_id)
+
 
 async def increment_accepted(user_id: int, delta: int = 1):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET accepted_count = accepted_count + ? WHERE user_id = ?", (delta, user_id))
-            await db.commit()
-    except Exception as e:
-        print(f"[db][ERROR] increment_accepted({user_id}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("UPDATE users SET accepted_count = accepted_count + $1 WHERE user_id = $2", delta, user_id)
+
 
 async def increment_declined(user_id: int, delta: int = 1):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET declined_count = declined_count + ? WHERE user_id = ?", (delta, user_id))
-            await db.commit()
-    except Exception as e:
-        print(f"[db][ERROR] increment_declined({user_id}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        await conn.execute("UPDATE users SET declined_count = declined_count + $1 WHERE user_id = $2", delta, user_id)
+
 
 async def create_proposal_entry(user_id: int, user_chat_id: int, user_msg_id: int) -> int:
-    try:
-        ts = int(time.time())
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "INSERT INTO proposals (user_id, user_chat_id, user_msg_id, created_at) VALUES (?, ?, ?, ?)",
-                (user_id, user_chat_id, user_msg_id, ts),
-            )
-            await db.commit()
-            return cur.lastrowid
-    except Exception as e:
-        print(f"[db][ERROR] create_proposal_entry({user_id}) failed: {e}", file=sys.stderr)
-        raise
+    ts = int(time.time())
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO proposals (user_id, user_chat_id, user_msg_id, created_at) "
+            "VALUES ($1, $2, $3, $4) RETURNING id",
+            user_id,
+            user_chat_id,
+            user_msg_id,
+            ts,
+        )
+        return int(row["id"])
+
 
 async def update_proposal_ids(proposal_id: int, header_msg_id: int = None, post_msg_id: int = None, mod_msg_id: int = None):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            q = "UPDATE proposals SET "
-            parts = []
-            args = []
-            if header_msg_id is not None:
-                parts.append("group_header_msg_id = ?")
-                args.append(header_msg_id)
-            if post_msg_id is not None:
-                parts.append("group_post_msg_id = ?")
-                args.append(post_msg_id)
-            if mod_msg_id is not None:
-                parts.append("group_mod_msg_id = ?")
-                args.append(mod_msg_id)
-            if not parts:
-                return
-            q += ", ".join(parts) + " WHERE id = ?"
-            args.append(proposal_id)
-            await db.execute(q, tuple(args))
-            await db.commit()
-    except Exception as e:
-        print(f"[db][ERROR] update_proposal_ids({proposal_id}) failed: {e}", file=sys.stderr)
-        raise
+    parts = []
+    args = []
+    if header_msg_id is not None:
+        parts.append("group_header_msg_id = $%d" % (len(parts) + 1))
+        args.append(header_msg_id)
+    if post_msg_id is not None:
+        parts.append("group_post_msg_id = $%d" % (len(parts) + 1 + len(args)))
+        args.append(post_msg_id)
+    if mod_msg_id is not None:
+        parts.append("group_mod_msg_id = $%d" % (len(parts) + 1 + len(args)))
+        args.append(mod_msg_id)
+    if not parts:
+        return
+    # Build query with correct parameter numbering
+    set_clause = ", ".join(parts)
+    params = args + [proposal_id]
+    # Compute parameter placeholders for WHERE as $N
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(f"UPDATE proposals SET {set_clause} WHERE id = ${len(args)+1}", *params)
+
 
 async def set_proposal_status_and_mod(proposal_id: int, status: str, mod_id: Optional[int] = None, action: Optional[str] = None, param: Optional[str] = None):
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE proposals SET status = ?, mod_id = ?, mod_action = ?, mod_action_param = ? WHERE id = ?",
-                (status, mod_id, action, param, proposal_id),
-            )
-            await db.commit()
-    except Exception as e:
-        print(f"[db][ERROR] set_proposal_status_and_mod({proposal_id}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        await conn.execute(
+            "UPDATE proposals SET status = $1, mod_id = $2, mod_action = $3, mod_action_param = $4 WHERE id = $5",
+            status,
+            mod_id,
+            action,
+            param,
+            proposal_id,
+        )
+
 
 async def get_proposal(proposal_id: int) -> Optional[Dict[str, Any]]:
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute(
-                "SELECT id, user_id, user_chat_id, user_msg_id, group_header_msg_id, group_post_msg_id, group_mod_msg_id, created_at, status, mod_id, mod_action, mod_action_param FROM proposals WHERE id = ?",
-                (proposal_id,),
-            )
-            row = await cur.fetchone()
-            if not row:
-                return None
-            return {
-                "id": row[0],
-                "user_id": row[1],
-                "user_chat_id": row[2],
-                "user_msg_id": row[3],
-                "group_header_msg_id": row[4],
-                "group_post_msg_id": row[5],
-                "group_mod_msg_id": row[6],
-                "created_at": row[7],
-                "status": row[8],
-                "mod_id": row[9],
-                "mod_action": row[10],
-                "mod_action_param": row[11],
-            }
-    except Exception as e:
-        print(f"[db][ERROR] get_proposal({proposal_id}) failed: {e}", file=sys.stderr)
-        raise
+    async with DB_POOL.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, user_id, user_chat_id, user_msg_id, group_header_msg_id, group_post_msg_id, group_mod_msg_id, created_at, status, mod_id, mod_action, mod_action_param "
+            "FROM proposals WHERE id = $1",
+            proposal_id,
+        )
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "user_id": row["user_id"],
+            "user_chat_id": row["user_chat_id"],
+            "user_msg_id": row["user_msg_id"],
+            "group_header_msg_id": row["group_header_msg_id"],
+            "group_post_msg_id": row["group_post_msg_id"],
+            "group_mod_msg_id": row["group_mod_msg_id"],
+            "created_at": row["created_at"],
+            "status": row["status"],
+            "mod_id": row["mod_id"],
+            "mod_action": row["mod_action"],
+            "mod_action_param": row["mod_action_param"],
+        }
 
 # ---------- UTIL (keyboards & helpers) ----------
 def make_lang_kb():
@@ -341,25 +303,20 @@ def make_lang_kb():
     ])
     return kb
 
+
 def main_menu_kb(lang: str):
     if lang == "uk":
-        text_propose = "🖼️ Запропонувати пост"
-        text_support = "📩 Підтримка"
-        text_lang = "🗣️ Змінити мову"
-        text_privacy = "📋 Політика конфіденційності"
+        text = WELCOME_UK  # formatted elsewhere
     else:
-        text_propose = "🖼️ Предложить пост"
-        text_support = "📩 Поддержка"
-        text_lang = "🗣️ Сменить язык"
-        text_privacy = "📋 Политика конфиденциальности"
-
+        text = WELCOME_RU
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=text_propose, callback_data="main:propose")],
-        [InlineKeyboardButton(text=text_support, callback_data="main:support")],
-        [InlineKeyboardButton(text=text_lang, callback_data="main:lang")],
-        [InlineKeyboardButton(text=text_privacy, callback_data="main:privacy")],
+        [InlineKeyboardButton(text="🖼️ Предложить пост" if lang != "uk" else "🖼️ Запропонувати пост", callback_data="main:propose")],
+        [InlineKeyboardButton(text="📩 Поддержка" if lang != "uk" else "📩 Підтримка", callback_data="main:support")],
+        [InlineKeyboardButton(text="🗣️ Сменить язык" if lang != "uk" else "🗣️ Змінити мову", callback_data="main:lang")],
+        [InlineKeyboardButton(text="📋 Политика конфиденциальности" if lang != "uk" else "📋 Політика конфіденційності", callback_data="main:privacy")],
     ])
     return kb
+
 
 def cancel_kb(lang: str):
     txt = CANCEL_TEXT_UK if lang == "uk" else CANCEL_TEXT_RU
@@ -368,13 +325,16 @@ def cancel_kb(lang: str):
     ])
     return kb
 
+
 def mod_buttons_vertical(proposal_id: int):
+    # vertical: each button in its own row
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"mod:accept:{proposal_id}")],
         [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod:decline:{proposal_id}")],
         [InlineKeyboardButton(text="🚫 Бан пользователя", callback_data=f"mod:ban:{proposal_id}")],
     ])
     return kb
+
 
 def ban_duration_kb(proposal_id: int):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -387,7 +347,9 @@ def ban_duration_kb(proposal_id: int):
     ])
     return kb
 
+
 def rep_buttons_vertical(proposal_id: int):
+    # awarding reputation: vertical buttons
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🆙 +3 репутации", callback_data=f"rep:3:{proposal_id}")],
         [InlineKeyboardButton(text="🆙 +2 репутации", callback_data=f"rep:2:{proposal_id}")],
@@ -395,7 +357,9 @@ def rep_buttons_vertical(proposal_id: int):
     ])
     return kb
 
+
 def decline_penalty_kb(proposal_id: int):
+    # first choose penalty -0 or -1 (vertical)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🆙 -0 репутации", callback_data=f"declpen:0:{proposal_id}")],
         [InlineKeyboardButton(text="🆙 -1 репутация", callback_data=f"declpen:1:{proposal_id}")],
@@ -403,11 +367,14 @@ def decline_penalty_kb(proposal_id: int):
     ])
     return kb
 
+
 def final_choice_kb(action_label: str, proposal_id: int):
+    # single info button
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"ℹ️ Выбрано: {action_label}", callback_data=f"info:{proposal_id}")]
     ])
     return kb
+
 
 def format_remaining(ts_end: int) -> str:
     if ts_end <= 0:
@@ -420,29 +387,34 @@ def format_remaining(ts_end: int) -> str:
     minutes = (rem % 3600) // 60
     return f"{days}д, {hours}ч, {minutes}м"
 
+
 def human_date(ts: int) -> str:
     dt = datetime.fromtimestamp(ts)
     day = dt.day
     month_name = dt.strftime("%B")
     return f"{day} {month_name}"
 
+
 def user_mention_html_from_user(user: types.User) -> str:
-    if getattr(user, "username", None):
+    if user.username:
         return f"@{user.username}"
     else:
         full_name = (user.full_name or str(user.id))
         return f'<a href="tg://user?id={user.id}">{full_name}</a>'
+
 
 # ---------- BOT SETUP ----------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ---------- HANDLERS ----------
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user = message.from_user
     await ensure_user_row(user.id)
     row = await get_user(user.id)
+    # If user selected language before -> show main menu immediately
     if row and row["lang_selected"]:
         lang = row["lang"] or "ru"
         rep = row["reputation"]
@@ -452,8 +424,10 @@ async def cmd_start(message: types.Message):
         await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
         return
 
+    # else show language selection
     prompt = LANG_PROMPT_UK if (row and row.get("lang") == "uk") else LANG_PROMPT_RU
     await message.answer(prompt, reply_markup=make_lang_kb())
+
 
 @dp.callback_query(F.data and F.data.startswith("set_lang:"))
 async def cb_set_lang(call: types.CallbackQuery):
@@ -462,17 +436,20 @@ async def cb_set_lang(call: types.CallbackQuery):
     user_id = call.from_user.id
     await ensure_user_row(user_id)
     await set_user_lang(user_id, lang)
+    # delete the language selection message
     try:
         await call.message.delete()
     except Exception:
         pass
 
+    # send welcome message in chosen language
     row = await get_user(user_id)
     rep = row["reputation"] if row else 0
     accepted = row["accepted_count"] if row else 0
     declined = row["declined_count"] if row else 0
     text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
     await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
+
 
 @dp.callback_query(F.data == "main:lang")
 async def cb_main_change_lang(call: types.CallbackQuery):
@@ -481,6 +458,7 @@ async def cb_main_change_lang(call: types.CallbackQuery):
     lang = row["lang"] if (row and row.get("lang")) else "ru"
     prompt = LANG_PROMPT_UK if lang == "uk" else LANG_PROMPT_RU
     await call.message.answer(prompt, reply_markup=make_lang_kb())
+
 
 @dp.callback_query(F.data == "main:propose")
 async def cb_main_propose(call: types.CallbackQuery):
@@ -500,6 +478,7 @@ async def cb_main_propose(call: types.CallbackQuery):
     prompt = PROPOSE_PROMPT_UK if lang == "uk" else PROPOSE_PROMPT_RU
     await call.message.answer(prompt, reply_markup=cancel_kb(lang))
 
+
 @dp.callback_query(F.data == "propose:cancel")
 async def cb_propose_cancel(call: types.CallbackQuery):
     await call.answer()
@@ -516,6 +495,7 @@ async def cb_propose_cancel(call: types.CallbackQuery):
         pass
     text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
     await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
+
 
 # while in propose mode: treat any incoming content as a post
 @dp.message()
@@ -539,14 +519,9 @@ async def handle_any_message(message: types.Message):
         return
 
     # create DB entry
-    try:
-        proposal_id = await create_proposal_entry(uid, message.chat.id, message.message_id)
-    except Exception:
-        await message.reply("Ошибка сохранения заявки. Попробуйте позже.")
-        await set_in_propose(uid, False)
-        return
+    proposal_id = await create_proposal_entry(uid, message.chat.id, message.message_id)
 
-    # header text (separate message with date/time)
+    # header text (send as first message)
     post_ts = int(time.time())
     hhmm = datetime.fromtimestamp(post_ts).strftime("%H:%M")
     human = human_date(post_ts)
@@ -563,33 +538,36 @@ async def handle_any_message(message: types.Message):
 
     group_post_msg_id = None
     group_header_msg_id = None
+    # group_mod_msg_id will be set to the content message id (we attach buttons to it)
     group_mod_msg_id = None
 
     try:
-        # 1) send header message first (HTML parsing so mention is clickable)
-        try:
-            header_sent = await bot.send_message(PREDLOJKA_ID, header_text, parse_mode="HTML")
-            group_header_msg_id = header_sent.message_id
-        except Exception:
-            # fallback plain text
-            header_sent = await bot.send_message(PREDLOJKA_ID, header_text)
-            group_header_msg_id = header_sent.message_id
+        # Send header as first message (plain text, HTML allowed)
+        header_sent = await bot.send_message(PREDLOJKA_ID, header_text, parse_mode="HTML")
+        group_header_msg_id = header_sent.message_id
 
-        # 2) send content + links as second message (and attach moderation buttons to this message)
+        # Now send or copy content as SECOND message and attach mod buttons to THAT message.
         if message.content_type == ContentType.TEXT:
             orig_text = message.text or ""
             html_text = entities_to_html(orig_text, message.entities or [])
-            combined_html = f"{html_text}\n\n{APPENDED_LINKS_HTML}" if html_text else APPENDED_LINKS_HTML
-            # disable web page preview to prevent link preview
-            sent = await bot.send_message(PREDLOJKA_ID, combined_html, parse_mode="HTML", disable_web_page_preview=True, reply_markup=mod_buttons_vertical(proposal_id))
+            combined_html = f"{html_text}\n\n{APPENDED_LINKS_HTML}"
+            # send content message with links appended and mod buttons; disable preview
+            sent = await bot.send_message(
+                PREDLOJKA_ID,
+                combined_html,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=mod_buttons_vertical(proposal_id),
+            )
             group_post_msg_id = sent.message_id
-            group_mod_msg_id = sent.message_id  # mod message is the same
+            group_mod_msg_id = sent.message_id  # same message holds moderation buttons
+
         else:
-            # media: copy the message, then edit caption to append links, and set reply_markup on that message
+            # For media: copy original message as new message (media) then edit caption to include links
             copied = await bot.copy_message(chat_id=PREDLOJKA_ID, from_chat_id=message.chat.id, message_id=message.message_id)
             if copied:
                 group_post_msg_id = copied.message_id
-                # build caption/text to append links
+                # build caption or text to set
                 existing_caption = getattr(message, "caption", None)
                 existing_text = getattr(message, "text", None)
                 base = existing_caption if existing_caption is not None else (existing_text or "")
@@ -598,33 +576,35 @@ async def handle_any_message(message: types.Message):
                     base_html = entities_to_html(base, caption_entities)
                 else:
                     base_html = ""
-                combined_html = f"{base_html}\n\n{APPENDED_LINKS_HTML}" if base_html else APPENDED_LINKS_HTML
-                # try edit caption, else try edit text
+                combined_html = f"{base_html}\n\n{APPENDED_LINKS_HTML}" if base_html else f"{APPENDED_LINKS_HTML}"
+                # Edit caption and attach moderation buttons
                 try:
-                    await bot.edit_message_caption(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, caption=combined_html, parse_mode="HTML")
+                    await bot.edit_message_caption(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, caption=combined_html, parse_mode="HTML", reply_markup=mod_buttons_vertical(proposal_id))
                 except Exception:
+                    # fallback to editing text if caption not supported
                     try:
-                        await bot.edit_message_text(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, text=combined_html, parse_mode="HTML")
+                        await bot.edit_message_text(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, text=combined_html, parse_mode="HTML", reply_markup=mod_buttons_vertical(proposal_id))
                     except Exception:
                         pass
-                # attach moderation buttons (edit reply markup)
-                try:
-                    await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, reply_markup=mod_buttons_vertical(proposal_id))
-                except Exception:
-                    pass
                 group_mod_msg_id = group_post_msg_id
 
+        # Safety: ensure group_mod_msg_id set (attach buttons to content message)
+        if group_mod_msg_id is None and group_post_msg_id is not None:
+            # try editing content message to add mod buttons
+            try:
+                await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, reply_markup=mod_buttons_vertical(proposal_id))
+                group_mod_msg_id = group_post_msg_id
+            except Exception:
+                pass
+
     except Exception as e:
-        print(f"[post][ERROR] while sending to PREDLOJKA: {e}", file=sys.stderr)
+        # if anything failed, notify user and abort gracefully
         await message.reply("Ошибка при отправке в предложку. Попробуйте позже.")
         await set_in_propose(uid, False)
         return
 
-    # update proposal record in DB
-    try:
-        await update_proposal_ids(proposal_id, header_msg_id=group_header_msg_id, post_msg_id=group_post_msg_id, mod_msg_id=group_mod_msg_id)
-    except Exception:
-        print(f"[db][WARN] Failed to update proposal ids for {proposal_id}", file=sys.stderr)
+    # Update proposal record with header and post and mod ids
+    await update_proposal_ids(proposal_id, header_msg_id=group_header_msg_id, post_msg_id=group_post_msg_id, mod_msg_id=group_mod_msg_id)
 
     # notify user
     confirm_text = CONFIRM_SENT_UK if lang == "uk" else CONFIRM_SENT_RU
@@ -639,19 +619,20 @@ async def handle_any_message(message: types.Message):
     # exit propose mode
     await set_in_propose(uid, False)
 
-    # send main menu
+    # after 1 second send main menu again
     await asyncio.sleep(1)
+    row2 = await get_user(uid)
+    rep2 = row2["reputation"] if row2 else 0
+    accepted2 = row2["accepted_count"] if row2 else 0
+    declined2 = row2["declined_count"] if row2 else 0
+    welcome = WELCOME_UK.format(rep=rep2, accepted=accepted2, declined=declined2) if lang == "uk" else WELCOME_RU.format(rep=rep2, accepted=accepted2, declined=declined2)
     try:
-        row2 = await get_user(uid)
-        rep2 = row2["reputation"] if row2 else 0
-        accepted2 = row2["accepted_count"] if row2 else 0
-        declined2 = row2["declined_count"] if row2 else 0
-        welcome = WELCOME_UK.format(rep=rep2, accepted=accepted2, declined=declined2) if lang == "uk" else WELCOME_RU.format(rep=rep2, accepted=accepted2, declined=declined2)
         await bot.send_message(uid, welcome, reply_markup=main_menu_kb(lang), parse_mode="HTML")
     except Exception:
         pass
 
-# ---------- Moderation callbacks ----------
+
+# ---------- Moderation callbacks in PREDLOJKA group ----------
 @dp.callback_query(F.data and F.data.startswith("mod:"))
 async def cb_mod_actions(call: types.CallbackQuery):
     await call.answer()
@@ -671,19 +652,24 @@ async def cb_mod_actions(call: types.CallbackQuery):
     user_chat_id = prop["user_chat_id"]
     user_msg_id = prop["user_msg_id"]
 
+    # Accept => change mod message to rep awarding buttons (vertical)
     if action == "accept":
+        # copy the group's post message (bot's message) to CHANNEL_ID (so it will include appended links)
         if CHANNEL_ID and prop.get("group_post_msg_id"):
             try:
                 await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
             except Exception:
                 pass
+        # set status accepted (mod_id empty until final rep chosen)
         await set_proposal_status_and_mod(proposal_id, "accepted", None, "accept", None)
+        # replace mod message (the one with links) with rep buttons
         try:
             await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=rep_buttons_vertical(proposal_id), parse_mode="HTML")
         except Exception:
             pass
         return
 
+    # Decline => show penalty options first
     if action == "decline":
         try:
             await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=decline_penalty_kb(proposal_id), parse_mode="HTML")
@@ -691,12 +677,14 @@ async def cb_mod_actions(call: types.CallbackQuery):
             pass
         return
 
+    # Ban => show ban duration keyboard
     if action == "ban":
         try:
             await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=ban_duration_kb(proposal_id), parse_mode="HTML")
         except Exception:
             pass
         return
+
 
 @dp.callback_query(F.data and F.data.startswith("declpen:"))
 async def cb_decline_penalty(call: types.CallbackQuery):
@@ -708,12 +696,14 @@ async def cb_decline_penalty(call: types.CallbackQuery):
         return
 
     if arg == "back":
+        # go back to mod buttons
         try:
             await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=mod_buttons_vertical(proposal_id), parse_mode="HTML")
         except Exception:
             pass
         return
 
+    # penalty value: 0 or 1
     try:
         penalty = int(arg)
     except Exception:
@@ -726,11 +716,15 @@ async def cb_decline_penalty(call: types.CallbackQuery):
     user_id = prop["user_id"]
     user_chat_id = prop["user_chat_id"]
     user_msg_id = prop["user_msg_id"]
+
     mod_id = call.from_user.id
 
+    # apply decline and penalty
     if penalty == 0:
+        # no reputation change
         await set_proposal_status_and_mod(proposal_id, "declined", mod_id, "decline", "0")
         await increment_declined(user_id, 1)
+        # notify user
         urow = await get_user(user_id)
         lang = urow["lang"] if urow else "ru"
         text = DECLINE_NOTICE_UK if lang == "uk" else DECLINE_NOTICE_RU
@@ -748,9 +742,11 @@ async def cb_decline_penalty(call: types.CallbackQuery):
             pass
         return
     elif penalty == 1:
+        # subtract 1 reputation
         await add_reputation(user_id, -1)
         await set_proposal_status_and_mod(proposal_id, "declined", mod_id, "decline", "-1")
         await increment_declined(user_id, 1)
+        # notify user about decline and penalty
         urow = await get_user(user_id)
         lang = urow["lang"] if urow else "ru"
         text = DECLINE_PENALTY_NOTICE_UK.format(n=1) if lang == "uk" else DECLINE_PENALTY_NOTICE_RU.format(n=1)
@@ -767,6 +763,7 @@ async def cb_decline_penalty(call: types.CallbackQuery):
         except Exception:
             pass
         return
+
 
 @dp.callback_query(F.data and F.data.startswith("ban:"))
 async def cb_ban_duration(call: types.CallbackQuery):
@@ -814,6 +811,7 @@ async def cb_ban_duration(call: types.CallbackQuery):
     await set_banned_until(user_id, until)
     await set_proposal_status_and_mod(proposal_id, "banned", call.from_user.id, "ban", timestr)
 
+    # notify user about ban
     urow = await get_user(user_id)
     lang = urow["lang"] if urow else "ru"
     period = format_remaining(until)
@@ -826,14 +824,17 @@ async def cb_ban_duration(call: types.CallbackQuery):
         except Exception:
             pass
 
+    # edit mod message to final choice button
     final_label = f"🚫 Бан"
     try:
         await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id), parse_mode="HTML")
     except Exception:
         pass
 
+
 @dp.callback_query(F.data and F.data.startswith("rep:"))
 async def cb_rep_buttons(call: types.CallbackQuery):
+    # award reputation
     await call.answer()
     parts = call.data.split(":")
     if len(parts) < 3:
@@ -850,10 +851,12 @@ async def cb_rep_buttons(call: types.CallbackQuery):
     user_chat_id = prop["user_chat_id"]
     user_msg_id = prop["user_msg_id"]
 
+    # add reputation and mark published
     await add_reputation(user_id, rep_amount)
     await increment_accepted(user_id, 1)
     await set_proposal_status_and_mod(proposal_id, "published", call.from_user.id, "accept", str(rep_amount))
 
+    # notify author
     urow = await get_user(user_id)
     lang = urow["lang"] if urow else "ru"
     text = (ACCEPT_NOTICE_UK if lang == "uk" else ACCEPT_NOTICE_RU).format(n=rep_amount)
@@ -865,25 +868,31 @@ async def cb_rep_buttons(call: types.CallbackQuery):
         except Exception:
             pass
 
+    # change mod message to final info button
     final_label = f"✅ Принять +{rep_amount}"
     try:
         await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id), parse_mode="HTML")
     except Exception:
         pass
 
+
 @dp.callback_query(F.data and F.data.startswith("info:"))
 async def cb_info(call: types.CallbackQuery):
+    # show an alert with info about proposal and moderator (single call.answer with show_alert)
     parts = call.data.split(":")
     proposal_id = int(parts[1]) if len(parts) > 1 else None
     if proposal_id is None:
+        await call.answer("Не найдена заявка.", show_alert=True)
         return
     prop = await get_proposal(proposal_id)
     if not prop:
         await call.answer("Не найдена заявка.", show_alert=True)
         return
 
+    # get proposer and moderator info
     proposer_id = prop["user_id"]
     mod_id = prop["mod_id"]
+    # fetch chat/user data via API to get usernames/nicks (best-effort)
     try:
         proposer = await bot.get_chat(proposer_id)
     except Exception:
@@ -916,25 +925,21 @@ async def cb_info(call: types.CallbackQuery):
     )
     await call.answer(info_text, show_alert=True)
 
+
 # ---------- Background unban notifier ----------
 async def unban_watcher():
     while True:
         try:
             now = int(time.time())
-            async with aiosqlite.connect(DB_PATH) as db:
-                cur = await db.execute("SELECT user_id, banned_until, lang FROM users WHERE banned_until > 0 AND banned_until <= ?", (now,))
-                rows = await cur.fetchall()
+            async with DB_POOL.acquire() as conn:
+                rows = await conn.fetch("SELECT user_id, banned_until, lang FROM users WHERE banned_until > 0 AND banned_until <= $1", now)
                 if rows:
                     for r in rows:
-                        user_id = r[0]
-                        await db.execute("UPDATE users SET banned_until = 0 WHERE user_id = ?", (user_id,))
-                        await db.commit()
-                        try:
-                            cur2 = await db.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,))
-                            r2 = await cur2.fetchone()
-                            lang = r2[0] if r2 else "ru"
-                        except Exception:
-                            lang = "ru"
+                        user_id = r["user_id"]
+                        # reset ban
+                        await conn.execute("UPDATE users SET banned_until = 0 WHERE user_id = $1", user_id)
+                        # try to notify user
+                        lang = r["lang"] if r and "lang" in r else "ru"
                         text = UNBANNED_NOTICE_UK if lang == "uk" else UNBANNED_NOTICE_RU
                         try:
                             await bot.send_message(user_id, text)
@@ -944,7 +949,8 @@ async def unban_watcher():
             pass
         await asyncio.sleep(CHECK_UNBAN_SECONDS)
 
-# ---------- Health server ----------
+
+# ---------- Health server (for Render Web Service) ----------
 async def start_health_server():
     port = int(os.environ.get("PORT", "8000"))
     async def health(request):
@@ -957,11 +963,16 @@ async def start_health_server():
     await site.start()
     print(f"[health] Listening on 0.0.0.0:{port}")
 
-# ---------- Entities -> HTML converter ----------
+
+# ---------- Utilities: entity -> HTML converter ----------
 def escape_html(text: str) -> str:
     return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 def entities_to_html(text: str, entities: Optional[List[MessageEntity]]) -> str:
+    """
+    Convert message text + entities -> HTML string.
+    Supports common entity types: bold, italic, code, pre, underline, strikethrough, text_link, text_mention, url.
+    """
     if not entities:
         return escape_html(text)
     ents = sorted(entities, key=lambda e: e.offset)
@@ -974,27 +985,27 @@ def entities_to_html(text: str, entities: Optional[List[MessageEntity]]) -> str:
             parts.append(escape_html(text[last:start]))
         segment = text[start:end]
         seg_escaped = escape_html(segment)
-        t = e.type
-        if t == "bold":
+        etype = getattr(e, "type", None) or getattr(e, "t", None)
+        if etype == "bold":
             parts.append(f"<b>{seg_escaped}</b>")
-        elif t == "italic":
+        elif etype == "italic":
             parts.append(f"<i>{seg_escaped}</i>")
-        elif t == "underline":
+        elif etype == "underline":
             parts.append(f"<u>{seg_escaped}</u>")
-        elif t == "strikethrough":
+        elif etype == "strikethrough":
             parts.append(f"<s>{seg_escaped}</s>")
-        elif t == "code":
+        elif etype == "code":
             parts.append(f"<code>{seg_escaped}</code>")
-        elif t == "pre":
+        elif etype == "pre":
             lang = getattr(e, "language", "")
             if lang:
                 parts.append(f"<pre><code class=\"language-{escape_html(lang)}\">{seg_escaped}</code></pre>")
             else:
                 parts.append(f"<pre>{seg_escaped}</pre>")
-        elif t == "text_link":
+        elif etype == "text_link":
             url = getattr(e, "url", "")
             parts.append(f'<a href="{escape_html(url)}">{seg_escaped}</a>')
-        elif t == "text_mention":
+        elif etype == "text_mention":
             user = getattr(e, "user", None)
             if user:
                 parts.append(f'<a href="tg://user?id={user.id}">{seg_escaped}</a>')
@@ -1007,33 +1018,27 @@ def entities_to_html(text: str, entities: Optional[List[MessageEntity]]) -> str:
         parts.append(escape_html(text[last:]))
     return "".join(parts)
 
+
 # ---------- START ----------
 async def main():
-    # ensure DB dir exists
-    try:
-        ensure_db_dir()
-    except Exception as e:
-        print(f"[startup][FATAL] Cannot ensure DB directory: {e}", file=sys.stderr)
-        raise
-
-    # init DB
-    try:
-        await init_db()
-    except Exception as e:
-        print(f"[startup][FATAL] DB initialization failed: {e}", file=sys.stderr)
-        raise
-
-    # health server
+    global DB_POOL
+    await init_db()
+    # start health server so Render sees an open port
     try:
         await start_health_server()
     except Exception as e:
-        print(f"[health] failed to start health server: {e}", file=sys.stderr)
+        print(f"[health] failed to start health server: {e}")
 
-    # background
+    # start background unban watcher
     asyncio.create_task(unban_watcher())
     try:
         await dp.start_polling(bot)
     finally:
+        try:
+            if DB_POOL:
+                await DB_POOL.close()
+        except Exception:
+            pass
         await bot.session.close()
 
 if __name__ == "__main__":
