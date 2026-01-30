@@ -1,5 +1,15 @@
 # bot_new.py
-# Main bot using asyncpg (Neon/Postgres). See comments above for behavior.
+# Main bot using asyncpg (Neon/Postgres).
+# Changes included:
+# - persistent reply keyboard properly shown after language selection/start
+# - robust editing of media/text messages so moderation buttons always get replaced with final buttons
+# - month names in Russian for header ("От ... • HH:MM • D MMMM")
+# - header mention uses user's full name (not username) and links to tg://openmessage?user_id=<id>
+# - final info (ℹ️) now shows the requested detailed block (AUTHOR / ADMIN / ACTION) and for bans shows ban remaining instead of reputation
+# - added command "разбан <user_or_id>" (works in group with id == PREDLOJKA_ID)
+# - other small robustness fixes
+#
+# Requirements: aiogram, asyncpg, aiohttp
 
 import asyncio
 import os
@@ -390,29 +400,55 @@ def format_remaining(ts_end: int) -> str:
     minutes = (rem % 3600) // 60
     return f"{days}д, {hours}ч, {minutes}м"
 
-# Russian month names for human_date
+# russian month names in genitive (for "От ... • HH:MM • D month")
 MONTHS_RU = [
     "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря"
 ]
 
-def human_date(ts: int, lang: str = "ru") -> str:
+def human_date(ts: int) -> str:
     dt = datetime.fromtimestamp(ts)
     day = dt.day
-    month = dt.month
-    if lang == "uk":
-        # keep fallback (English month) for Ukrainian for now; could be localized if desired
-        month_name = dt.strftime("%B")
-    else:
-        month_name = MONTHS_RU[month - 1]
+    month_name = MONTHS_RU[dt.month - 1]
     return f"{day} {month_name}"
 
+def escape_html(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
 def user_mention_html_from_user(user: types.User) -> str:
-    if getattr(user, "username", None):
-        return f"@{user.username}"
-    else:
-        full_name = (user.full_name or str(user.id))
-        return f'<a href="tg://user?id={user.id}">{full_name}</a>'
+    # Use full name (not username) and link to tg://openmessage?user_id=<id>
+    full_name = (user.full_name or str(user.id))
+    return f'<a href="tg://openmessage?user_id={user.id}">{escape_html(full_name)}</a>'
+
+# helper to safely edit a (possibly media) message to swap/mod buttons and text/caption
+async def safe_edit_message_replace(chat_id: int, message_id: int, new_text: Optional[str], reply_markup: Optional[InlineKeyboardMarkup]):
+    """
+    Try to edit caption (for media) first, then edit text, then edit reply_markup as fallback.
+    new_text may be None (then we attempt to reuse existing caption/text; but Telegram API requires something for caption edit).
+    """
+    # try caption edit
+    try:
+        if new_text is None:
+            new_text = ""
+        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=new_text, parse_mode="HTML", reply_markup=reply_markup)
+        return True
+    except Exception:
+        pass
+    # try text edit
+    try:
+        if new_text is None:
+            new_text = ""
+        await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=new_text, parse_mode="HTML", reply_markup=reply_markup)
+        return True
+    except Exception:
+        pass
+    # try reply markup only
+    try:
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+        return True
+    except Exception:
+        pass
+    return False
 
 # ---------- BOT SETUP ----------
 bot = Bot(token=BOT_TOKEN)
@@ -434,11 +470,9 @@ async def cmd_start(message: types.Message):
         text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
         # show inline main menu + persistent reply keyboard
         await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-        prompt = "Выберите действие ⤵️" if lang != "uk" else "Оберіть дію ⤵️"
-        try:
-            await bot.send_message(message.chat.id, prompt, reply_markup=persistent_reply_kb(lang))
-        except Exception:
-            pass
+        # more reliable label than whitespace for reply keyboard
+        prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
+        await message.answer(prompt, reply_markup=persistent_reply_kb(lang))
         return
 
     # else show language selection (and remove any reply keyboard)
@@ -465,18 +499,11 @@ async def cb_set_lang(call: types.CallbackQuery):
     declined = row["declined_count"] if row else 0
     text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
     # send main inline menu
+    await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
+    # show persistent reply keyboard with visible prompt
+    prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
     try:
-        await bot.send_message(user_id, text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-    except Exception:
-        try:
-            await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-        except Exception:
-            pass
-
-    # show persistent reply keyboard with a clear prompt (avoid sending blank message)
-    prompt = "Выберите действие ⤵️" if lang != "uk" else "Оберіть дію ⤵️"
-    try:
-        await bot.send_message(user_id, prompt, reply_markup=persistent_reply_kb(lang))
+        await call.message.answer(prompt, reply_markup=persistent_reply_kb(lang))
     except Exception:
         pass
 
@@ -485,7 +512,7 @@ async def cb_main_change_lang(call: types.CallbackQuery):
     await call.answer()
     # remove persistent reply keyboard while changing language
     try:
-        await bot.send_message(call.from_user.id, " ", reply_markup=ReplyKeyboardRemove())
+        await call.message.answer(" ", reply_markup=ReplyKeyboardRemove())
     except Exception:
         pass
     row = await get_user(call.from_user.id)
@@ -528,9 +555,9 @@ async def cb_propose_cancel(call: types.CallbackQuery):
     text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
     await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
     # show persistent reply keyboard again
-    prompt = "Выберите действие ⤵️" if lang != "uk" else "Оберіть дію ⤵️"
+    prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
     try:
-        await bot.send_message(user_id, prompt, reply_markup=persistent_reply_kb(lang))
+        await call.message.answer(prompt, reply_markup=persistent_reply_kb(lang))
     except Exception:
         pass
 
@@ -559,7 +586,7 @@ async def cb_main_support(call: types.CallbackQuery):
 async def handle_any_message(message: types.Message):
     user = message.from_user
     uid = user.id
-    # allow pressing reply-keyboard buttons as text input to trigger commands
+    # reply keyboard text handling
     if message.text:
         txt = message.text.strip()
         # map reply keyboard text to actions
@@ -573,7 +600,6 @@ async def handle_any_message(message: types.Message):
             await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
             return
         if txt in ("🖼️ Предложить пост", "🖼️ Запропонувати пост"):
-            # emulate pressing propose
             await ensure_user_row(uid)
             row = await get_user(uid)
             lang = row["lang"] if row else "ru"
@@ -582,7 +608,6 @@ async def handle_any_message(message: types.Message):
             await message.answer(prompt, reply_markup=cancel_kb(lang))
             return
         if txt in ("📩 Поддержка", "📩 Підтримка"):
-            # delegate to support
             try:
                 import bot2
                 await bot2.send_support(bot, uid, (await get_user(uid))["lang"])
@@ -624,12 +649,12 @@ async def handle_any_message(message: types.Message):
         await set_in_propose(uid, False)
         return
 
-    # header text (send as first message)
+    # header text (send as first message) using full name link and Russian month
     post_ts = int(time.time())
     hhmm = datetime.fromtimestamp(post_ts).strftime("%H:%M")
-    human = human_date(post_ts, lang=lang)
+    human = human_date(post_ts)
     try:
-        mention_text = user_mention_html_from_user(user)
+        mention_text = user_mention_html_from_user(user)  # now full name linked to tg://openmessage
         header_text = f"От {mention_text} • {hhmm} • {human}"
     except Exception:
         header_text = f"От {uid} • {hhmm} • {human}"
@@ -653,7 +678,7 @@ async def handle_any_message(message: types.Message):
             orig_text = message.text or ""
             html_text = entities_to_html(orig_text, message.entities or [])
             combined_html = f"{html_text}\n\n{APPENDED_LINKS_HTML}"
-            # send content message with links appended and mod buttons; disable preview
+            # send content message with links appended and disable preview
             sent = await bot.send_message(
                 PREDLOJKA_ID,
                 combined_html,
@@ -662,16 +687,14 @@ async def handle_any_message(message: types.Message):
             )
             group_post_msg_id = sent.message_id
             # attach moderation buttons to content message
-            try:
-                await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, reply_markup=mod_buttons_vertical(proposal_id))
+            attached = await safe_edit_message_replace(PREDLOJKA_ID, group_post_msg_id, combined_html, mod_buttons_vertical(proposal_id))
+            if attached:
                 group_mod_msg_id = group_post_msg_id
-            except Exception:
-                # try to send a reply (attach another message with buttons but not links-only)
+            else:
+                # fallback: attach to header
                 try:
-                    sent2 = await bot.send_message(PREDLOJKA_ID, " ", reply_markup=mod_buttons_vertical(proposal_id))
-                    # immediately delete placeholder whitespace message if you don't want it visible
-                    await bot.delete_message(PREDLOJKA_ID, sent2.message_id)
-                    # fallback: if cannot attach, leave as None
+                    await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=group_header_msg_id, reply_markup=mod_buttons_vertical(proposal_id))
+                    group_mod_msg_id = group_header_msg_id
                 except Exception:
                     pass
 
@@ -690,27 +713,18 @@ async def handle_any_message(message: types.Message):
                     base_html = ""
                 combined_html = f"{base_html}\n\n{APPENDED_LINKS_HTML}" if base_html else f"{APPENDED_LINKS_HTML}"
                 # Try edit caption and add buttons in one op
-                try:
-                    await bot.edit_message_caption(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, caption=combined_html, parse_mode="HTML")
-                    # attach moderation buttons
+                attached = await safe_edit_message_replace(PREDLOJKA_ID, group_post_msg_id, combined_html, mod_buttons_vertical(proposal_id))
+                if attached:
+                    group_mod_msg_id = group_post_msg_id
+                else:
+                    # fallback: try to attach to header
                     try:
-                        await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, reply_markup=mod_buttons_vertical(proposal_id))
-                        group_mod_msg_id = group_post_msg_id
-                    except Exception:
-                        pass
-                except Exception:
-                    # fallback to edit text
-                    try:
-                        await bot.edit_message_text(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, text=combined_html, parse_mode="HTML")
-                        try:
-                            await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=group_post_msg_id, reply_markup=mod_buttons_vertical(proposal_id))
-                            group_mod_msg_id = group_post_msg_id
-                        except Exception:
-                            pass
+                        await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=group_header_msg_id, reply_markup=mod_buttons_vertical(proposal_id))
+                        group_mod_msg_id = group_header_msg_id
                     except Exception:
                         pass
 
-        # Safety: if we haven't attached mod buttons, attempt to attach to the header message (less ideal)
+        # Safety: ensure group_mod_msg_id set (attach buttons to header if needed)
         if group_mod_msg_id is None:
             try:
                 await bot.edit_message_reply_markup(chat_id=PREDLOJKA_ID, message_id=group_header_msg_id, reply_markup=mod_buttons_vertical(proposal_id))
@@ -756,7 +770,7 @@ async def handle_any_message(message: types.Message):
     welcome = WELCOME_UK.format(rep=rep2, accepted=accepted2, declined=declined2) if lang == "uk" else WELCOME_RU.format(rep=rep2, accepted=accepted2, declined=declined2)
     try:
         await bot.send_message(uid, welcome, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-        prompt = "Выберите действие ⤵️" if lang != "uk" else "Оберіть дію ⤵️"
+        prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
         await bot.send_message(uid, prompt, reply_markup=persistent_reply_kb(lang))
     except Exception:
         pass
@@ -780,6 +794,8 @@ async def cb_mod_actions(call: types.CallbackQuery):
     user_id = prop["user_id"]
     user_chat_id = prop["user_chat_id"]
     user_msg_id = prop["user_msg_id"]
+    target_chat = call.message.chat.id
+    target_msg_id = call.message.message_id
 
     # Accept => change mod message to rep awarding buttons (vertical)
     if action == "accept":
@@ -793,11 +809,12 @@ async def cb_mod_actions(call: types.CallbackQuery):
         await set_proposal_status_and_mod(proposal_id, "accepted", None, "accept", None)
         # replace mod message (the one with links) with rep buttons
         try:
-            # Try to edit reply_markup first (works for media messages)
-            await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=rep_buttons_vertical(proposal_id))
+            # try edit caption/text appropriately
+            await safe_edit_message_replace(target_chat, target_msg_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, rep_buttons_vertical(proposal_id))
         except Exception:
+            # fallback: try edit reply markup only
             try:
-                await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=rep_buttons_vertical(proposal_id), parse_mode="HTML")
+                await bot.edit_message_reply_markup(chat_id=target_chat, message_id=target_msg_id, reply_markup=rep_buttons_vertical(proposal_id))
             except Exception:
                 pass
         return
@@ -805,10 +822,10 @@ async def cb_mod_actions(call: types.CallbackQuery):
     # Decline => show penalty options first
     if action == "decline":
         try:
-            await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=decline_penalty_kb(proposal_id))
+            await safe_edit_message_replace(call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, decline_penalty_kb(proposal_id))
         except Exception:
             try:
-                await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=decline_penalty_kb(proposal_id), parse_mode="HTML")
+                await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=decline_penalty_kb(proposal_id))
             except Exception:
                 pass
         return
@@ -816,10 +833,10 @@ async def cb_mod_actions(call: types.CallbackQuery):
     # Ban => show ban duration keyboard
     if action == "ban":
         try:
-            await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=ban_duration_kb(proposal_id))
+            await safe_edit_message_replace(call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, ban_duration_kb(proposal_id))
         except Exception:
             try:
-                await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=ban_duration_kb(proposal_id), parse_mode="HTML")
+                await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=ban_duration_kb(proposal_id))
             except Exception:
                 pass
         return
@@ -835,10 +852,10 @@ async def cb_decline_penalty(call: types.CallbackQuery):
 
     if arg == "back":
         try:
-            await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=mod_buttons_vertical(proposal_id))
+            await safe_edit_message_replace(call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, mod_buttons_vertical(proposal_id))
         except Exception:
             try:
-                await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=mod_buttons_vertical(proposal_id), parse_mode="HTML")
+                await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=mod_buttons_vertical(proposal_id))
             except Exception:
                 pass
         return
@@ -873,11 +890,7 @@ async def cb_decline_penalty(call: types.CallbackQuery):
                 pass
         final_label = "❌ Отклонить"
         try:
-            # for media messages edit reply_markup; fallback to edit_text
-            try:
-                await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id))
-            except Exception:
-                await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id), parse_mode="HTML")
+            await safe_edit_message_replace(call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, final_choice_kb(final_label, proposal_id))
         except Exception:
             pass
         return
@@ -897,10 +910,7 @@ async def cb_decline_penalty(call: types.CallbackQuery):
                 pass
         final_label = "❌ Отклонить"
         try:
-            try:
-                await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id))
-            except Exception:
-                await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id), parse_mode="HTML")
+            await safe_edit_message_replace(call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, final_choice_kb(final_label, proposal_id))
         except Exception:
             pass
         return
@@ -916,12 +926,9 @@ async def cb_ban_duration(call: types.CallbackQuery):
 
     if dur == "back":
         try:
-            await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=mod_buttons_vertical(proposal_id))
+            await safe_edit_message_replace(call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, mod_buttons_vertical(proposal_id))
         except Exception:
-            try:
-                await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=mod_buttons_vertical(proposal_id), parse_mode="HTML")
-            except Exception:
-                pass
+            pass
         return
 
     prop = await get_proposal(proposal_id)
@@ -952,7 +959,7 @@ async def cb_ban_duration(call: types.CallbackQuery):
         return
 
     await set_banned_until(user_id, until)
-    # store 'ban' action; for param we store timestr but info will display rep as "0"
+    # store action param as textual timestr (we also rely on users.banned_until for remaining)
     await set_proposal_status_and_mod(proposal_id, "banned", call.from_user.id, "ban", timestr)
 
     urow = await get_user(user_id)
@@ -969,10 +976,7 @@ async def cb_ban_duration(call: types.CallbackQuery):
 
     final_label = f"🚫 Бан"
     try:
-        try:
-            await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id))
-        except Exception:
-            await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id), parse_mode="HTML")
+        await safe_edit_message_replace(call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, final_choice_kb(final_label, proposal_id))
     except Exception:
         pass
 
@@ -1010,12 +1014,9 @@ async def cb_rep_buttons(call: types.CallbackQuery):
             pass
 
     final_label = f"✅ Принять +{rep_amount}"
-    # Try to change buttons on the mod message. Use edit_message_reply_markup first (works for media), fallback to edit_message_text
+    # robust replacement of mod message with final info button
     try:
-        try:
-            await bot.edit_message_reply_markup(chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id))
-        except Exception:
-            await bot.edit_message_text(call.message.text or APPENDED_LINKS_HTML, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=final_choice_kb(final_label, proposal_id), parse_mode="HTML")
+        await safe_edit_message_replace(call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, final_choice_kb(final_label, proposal_id))
     except Exception:
         pass
 
@@ -1034,11 +1035,12 @@ async def cb_info(call: types.CallbackQuery):
     proposer_id = prop["user_id"]
     mod_id = prop["mod_id"]
 
-    # Fetch proposer and moderator (best-effort)
+    # fetch proposer user (best-effort)
     try:
         proposer = await bot.get_chat(proposer_id)
     except Exception:
         proposer = None
+
     if mod_id:
         try:
             moderator = await bot.get_chat(mod_id)
@@ -1047,84 +1049,116 @@ async def cb_info(call: types.CallbackQuery):
     else:
         moderator = None
 
-    def fmt_name(u: Optional[types.User]) -> str:
+    def nick_and_username(u: Optional[types.User]) -> (str, str):
         if not u:
-            return "нет ника"
-        # full name (first + last if exists) or fallback to id
-        return getattr(u, "full_name", None) or (getattr(u, "first_name", "") + (" " + getattr(u, "last_name", "") if getattr(u, "last_name", None) else "")).strip() or str(getattr(u, "id", "—"))
+            return ("отсутствует", "отсутствует")
+        nick = u.full_name or str(u.id)
+        uname = f"@{u.username}" if getattr(u, "username", None) else "отсутствует"
+        return (nick, uname)
 
-    def fmt_username(u: Optional[types.User]) -> str:
-        if not u:
-            return "отсутствует"
-        return f"@{u.username}" if getattr(u, "username", None) else "отсутствует"
+    a_nick, a_uname = nick_and_username(proposer)
+    m_nick, m_uname = nick_and_username(moderator)
 
-    def fmt_id(u: Optional[types.User]) -> str:
-        if not u:
-            return "—"
-        return str(getattr(u, "id", "—"))
-
-    author_nick = fmt_name(proposer)
-    author_user = fmt_username(proposer)
-    author_id = fmt_id(proposer)
-
-    admin_nick = fmt_name(moderator)
-    admin_user = fmt_username(moderator)
-    admin_id = fmt_id(moderator)
-
-    action = prop["mod_action"] or "—"
+    # determine action and param
+    action_key = prop["mod_action"] or "—"
     param = prop["mod_action_param"] or "—"
 
-    # map action to readable label
+    # build action label
     action_label = "—"
-    if action == "accept":
+    if action_key == "accept":
         action_label = "✅ Принять"
-    elif action == "decline":
+    elif action_key == "decline":
         action_label = "❌ Отклонить"
-    elif action == "ban":
+    elif action_key == "ban":
         action_label = "🚫 Бан пользователя"
     else:
-        action_label = action
+        action_label = action_key
 
-    # compute reputation change to display as "-1","0","+1"...
-    rep_change = "0"
-    if action == "accept":
-        # param should be number of rep awarded
-        try:
-            n = int(param)
-            rep_change = f"+{n}" if n > 0 else str(n)
-        except Exception:
-            rep_change = "0"
-    elif action == "decline":
-        try:
-            n = int(param)
-            rep_change = str(n) if n <= 0 else f"+{n}"
-        except Exception:
-            rep_change = "0"
-    elif action == "ban":
-        # ban usually doesn't change reputation in this flow -> show 0
-        rep_change = "0"
+    # For reputation / ban display:
+    if action_key == "ban":
+        # fetch user's current banned_until to show remaining
+        urow = await get_user(proposer_id)
+        banned_until = urow["banned_until"] if urow else 0
+        rep_or_ban = f"Срок бана: {format_remaining(banned_until)}"
     else:
-        # fallback
+        # param may be like "-1" or "2" or "0"
+        # show with sign
         try:
-            n = int(param)
-            rep_change = f"+{n}" if n > 0 else str(n)
+            v = int(param)
+            rep_or_ban = f"Репутация: {v:+d}"
         except Exception:
-            rep_change = "0"
+            rep_or_ban = f"Репутация: {param}"
 
+    # Construct final formatted info text per user's spec
     info_text = (
         f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
-        f"Ник: {author_nick}\n"
-        f"Юз: {author_user}\n"
-        f"Айди: {author_id}\n\n"
+        f"Ник: {escape_html(a_nick)}\n"
+        f"Юз: {a_uname}\n"
+        f"Айди: {proposer_id}\n\n"
         f"🛡️ 𝗔𝗗𝗠𝗜𝗡\n"
-        f"Ник: {admin_nick}\n"
-        f"Юз: {admin_user}\n"
-        f"Айди: {admin_id}\n\n"
+        f"Ник: {escape_html(m_nick)}\n"
+        f"Юз: {m_uname}\n"
+        f"Айди: {mod_id or '—'}\n\n"
         f"ℹ️ 𝗔𝗖𝗧𝗜𝗢𝗡\n"
         f"Действие: {action_label}\n"
-        f"Репутация: {rep_change}"
+        f"{rep_or_ban}"
     )
     await call.answer(info_text, show_alert=True)
+
+# ---------- Разбан команда в группе PREDLOJKA_ID ----------
+@dp.message()
+async def unban_command_in_group(message: types.Message):
+    # This handler only handles messages that look like "разбан <id_or_username>" in the PREDLOJKA_ID group
+    if message.chat is None or PREDLOJKA_ID is None:
+        return
+    if message.chat.id != PREDLOJKA_ID:
+        return
+    if not message.text:
+        return
+    text = message.text.strip()
+    # accept both "разбан 123" and "/разбан 123" and Latin variants
+    if not (text.startswith("разбан ") or text.startswith("/разбан ") or text.startswith("razban ") or text.startswith("/razban ")):
+        return
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        await message.reply("Укажите пользователя по @юзернейму или ID. Пример: разбан 123456789")
+        return
+    target = parts[1].strip()
+    # resolve target id
+    target_id = None
+    if target.startswith("@"):
+        try:
+            chat = await bot.get_chat(target)
+            target_id = chat.id
+        except Exception:
+            target_id = None
+    else:
+        # try parse int
+        try:
+            target_id = int(target)
+        except Exception:
+            # fallback: maybe a username without @
+            try:
+                chat = await bot.get_chat("@" + target)
+                target_id = chat.id
+            except Exception:
+                target_id = None
+    if target_id is None:
+        await message.reply("Не удалось определить пользователя. Укажите корректный @юзернейм или числовой ID.")
+        return
+    # perform unban in DB
+    try:
+        await set_banned_until(target_id, 0)
+    except Exception:
+        await message.reply("Ошибка при записи в базу. Попробуйте позже.")
+        return
+    # notify in group
+    await message.reply(f"Пользователь {target} (ID {target_id}) разбанен в предложке.")
+    # try to notify user
+    try:
+        await bot.send_message(target_id, "Вас разбанили в системе предложений постов. Вы снова можете предлагать посты.")
+    except Exception:
+        pass
 
 # ---------- Background unban notifier ----------
 async def unban_watcher():
@@ -1161,9 +1195,6 @@ async def start_health_server():
     print(f"[health] Listening on 0.0.0.0:{port}")
 
 # ---------- Utilities: entity -> HTML converter ----------
-def escape_html(text: str) -> str:
-    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-
 def entities_to_html(text: str, entities: Optional[List[MessageEntity]]) -> str:
     if not entities:
         return escape_html(text)
@@ -1183,7 +1214,7 @@ def entities_to_html(text: str, entities: Optional[List[MessageEntity]]) -> str:
         elif etype == "italic":
             parts.append(f"<i>{seg_escaped}</i>")
         elif etype == "underline":
-            parts.append(f"<u>{seg_escaped}</в u>")
+            parts.append(f"<u>{seg_escaped}</u>")
         elif etype == "strikethrough":
             parts.append(f"<s>{seg_escaped}</s>")
         elif etype == "code":
