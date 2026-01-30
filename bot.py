@@ -1,15 +1,6 @@
 # bot_new.py
 # Main bot using asyncpg (Neon/Postgres).
-# Changes included:
-# - persistent reply keyboard properly shown after language selection/start
-# - robust editing of media/text messages so moderation buttons always get replaced with final buttons
-# - month names in Russian for header ("От ... • HH:MM • D MMMM")
-# - header mention uses user's full name (not username) and links to tg://openmessage?user_id=<id>
-# - final info (ℹ️) now shows the requested detailed block (AUTHOR / ADMIN / ACTION) and for bans shows ban remaining instead of reputation
-# - added command "разбан <user_or_id>" (works in group with id == PREDLOJKA_ID)
-# - other small robustness fixes
-#
-# Requirements: aiogram, asyncpg, aiohttp
+# See README / comments for requirements.
 
 import asyncio
 import os
@@ -424,7 +415,7 @@ def user_mention_html_from_user(user: types.User) -> str:
 async def safe_edit_message_replace(chat_id: int, message_id: int, new_text: Optional[str], reply_markup: Optional[InlineKeyboardMarkup]):
     """
     Try to edit caption (for media) first, then edit text, then edit reply_markup as fallback.
-    new_text may be None (then we attempt to reuse existing caption/text; but Telegram API requires something for caption edit).
+    new_text may be None (then we attempt to reuse empty string).
     """
     # try caption edit
     try:
@@ -467,12 +458,18 @@ async def cmd_start(message: types.Message):
         rep = row["reputation"]
         accepted = row["accepted_count"]
         declined = row["declined_count"]
-        text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
-        # show inline main menu + persistent reply keyboard
-        await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-        # more reliable label than whitespace for reply keyboard
-        prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
-        await message.answer(prompt, reply_markup=persistent_reply_kb(lang))
+        welcome_text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
+        # send welcome WITH reply keyboard (bot.send_message ensures reliable display)
+        try:
+            await bot.send_message(message.from_user.id, welcome_text, parse_mode="HTML", reply_markup=persistent_reply_kb(lang))
+        except Exception:
+            # fallback: send without reply keyboard
+            await message.answer(welcome_text, parse_mode="HTML")
+        # send inline main menu as separate message (so reply keyboard remains visible)
+        try:
+            await bot.send_message(message.from_user.id, "Меню:", reply_markup=main_menu_kb(lang))
+        except Exception:
+            pass
         return
 
     # else show language selection (and remove any reply keyboard)
@@ -492,18 +489,25 @@ async def cb_set_lang(call: types.CallbackQuery):
     except Exception:
         pass
 
-    # send welcome message in chosen language and show reply keyboard
+    # prepare welcome and keyboards
     row = await get_user(user_id)
     rep = row["reputation"] if row else 0
     accepted = row["accepted_count"] if row else 0
     declined = row["declined_count"] if row else 0
-    text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
-    # send main inline menu
-    await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-    # show persistent reply keyboard with visible prompt
-    prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
+    welcome_text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
+
+    # send welcome with reply keyboard (bot.send_message to ensure client shows bottom keyboard)
     try:
-        await call.message.answer(prompt, reply_markup=persistent_reply_kb(lang))
+        await bot.send_message(user_id, welcome_text, parse_mode="HTML", reply_markup=persistent_reply_kb(lang))
+    except Exception:
+        try:
+            await call.message.answer(welcome_text, parse_mode="HTML")
+        except Exception:
+            pass
+
+    # send inline main menu message (as separate message so reply keyboard stays visible)
+    try:
+        await bot.send_message(user_id, "Меню:", reply_markup=main_menu_kb(lang))
     except Exception:
         pass
 
@@ -512,13 +516,19 @@ async def cb_main_change_lang(call: types.CallbackQuery):
     await call.answer()
     # remove persistent reply keyboard while changing language
     try:
-        await call.message.answer(" ", reply_markup=ReplyKeyboardRemove())
+        await bot.send_message(call.from_user.id, "Смена языка...", reply_markup=ReplyKeyboardRemove())
     except Exception:
         pass
     row = await get_user(call.from_user.id)
     lang = row["lang"] if (row and row.get("lang")) else "ru"
     prompt = LANG_PROMPT_UK if lang == "uk" else LANG_PROMPT_RU
-    await call.message.answer(prompt, reply_markup=make_lang_kb())
+    try:
+        await bot.send_message(call.from_user.id, prompt, reply_markup=make_lang_kb())
+    except Exception:
+        try:
+            await call.message.answer(prompt, reply_markup=make_lang_kb())
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "main:propose")
 async def cb_main_propose(call: types.CallbackQuery):
@@ -532,11 +542,11 @@ async def cb_main_propose(call: types.CallbackQuery):
     if banned_until and banned_until > now:
         rem = format_remaining(banned_until)
         text = BANNED_NOTICE_UK.format(period=rem) if lang == "uk" else BANNED_NOTICE_RU.format(period=rem)
-        await call.message.answer(text)
+        await bot.send_message(user_id, text)
         return
     await set_in_propose(user_id, True)
     prompt = PROPOSE_PROMPT_UK if lang == "uk" else PROPOSE_PROMPT_RU
-    await call.message.answer(prompt, reply_markup=cancel_kb(lang))
+    await bot.send_message(user_id, prompt, reply_markup=cancel_kb(lang))
 
 @dp.callback_query(F.data == "propose:cancel")
 async def cb_propose_cancel(call: types.CallbackQuery):
@@ -553,13 +563,14 @@ async def cb_propose_cancel(call: types.CallbackQuery):
     except Exception:
         pass
     text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
-    await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-    # show persistent reply keyboard again
-    prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
     try:
-        await call.message.answer(prompt, reply_markup=persistent_reply_kb(lang))
+        await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=persistent_reply_kb(lang))
+        await bot.send_message(user_id, "Меню:", reply_markup=main_menu_kb(lang))
     except Exception:
-        pass
+        try:
+            await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "main:support")
 async def cb_main_support(call: types.CallbackQuery):
@@ -586,7 +597,41 @@ async def cb_main_support(call: types.CallbackQuery):
 async def handle_any_message(message: types.Message):
     user = message.from_user
     uid = user.id
-    # reply keyboard text handling
+
+    # -------------- route commands that should be handled in command.py --------------
+    if message.text:
+        txt = message.text.strip()
+        txt_lower = txt.lower()
+
+        # info command / text variants -> delegate to command.info_cmd
+        if txt_lower.startswith("/info") or txt_lower in ("инфо", "інфо", "информация", "інформація"):
+            try:
+                import command
+                await command.info_cmd(message)
+            except Exception:
+                # safe fallback
+                try:
+                    await message.reply("инфо")
+                except Exception:
+                    pass
+            return
+
+        # razban command in PREDLOJKA group -> delegate to command.unban_cmd
+        if message.chat and PREDLOJKA_ID and message.chat.id == PREDLOJKA_ID:
+            # accept "/разбан", "разбан", "/razban", "razban"
+            if txt_lower.startswith("/разбан") or txt_lower.startswith("разбан") or txt_lower.startswith("/razban") or txt_lower.startswith("razban"):
+                try:
+                    import command
+                    # pass helpers set_banned_until (callable) so command module can operate DB
+                    await command.unban_cmd(message, bot, set_banned_until)
+                except Exception:
+                    try:
+                        await message.reply("Ошибка при выполнении команды разбан.")
+                    except Exception:
+                        pass
+                return
+
+    # ----------------- handle reply keyboard taps (menu etc) -----------------
     if message.text:
         txt = message.text.strip()
         # map reply keyboard text to actions
@@ -597,7 +642,15 @@ async def handle_any_message(message: types.Message):
             accepted = row["accepted_count"] if row else 0
             declined = row["declined_count"] if row else 0
             text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
-            await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
+            # send welcome with reply keyboard still visible
+            try:
+                await bot.send_message(uid, text, parse_mode="HTML", reply_markup=persistent_reply_kb(lang))
+                await bot.send_message(uid, "Меню:", reply_markup=main_menu_kb(lang))
+            except Exception:
+                try:
+                    await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
+                except Exception:
+                    pass
             return
         if txt in ("🖼️ Предложить пост", "🖼️ Запропонувати пост"):
             await ensure_user_row(uid)
@@ -605,7 +658,13 @@ async def handle_any_message(message: types.Message):
             lang = row["lang"] if row else "ru"
             await set_in_propose(uid, True)
             prompt = PROPOSE_PROMPT_UK if lang == "uk" else PROPOSE_PROMPT_RU
-            await message.answer(prompt, reply_markup=cancel_kb(lang))
+            try:
+                await bot.send_message(uid, prompt, reply_markup=cancel_kb(lang))
+            except Exception:
+                try:
+                    await message.answer(prompt, reply_markup=cancel_kb(lang))
+                except Exception:
+                    pass
             return
         if txt in ("📩 Поддержка", "📩 Підтримка"):
             try:
@@ -618,13 +677,14 @@ async def handle_any_message(message: types.Message):
             return
         if txt in ("🗣️ Сменить язык", "🗣️ Змінити мову"):
             # remove reply keyboard and show language selection
-            await message.answer(LANG_PROMPT_RU, reply_markup=make_lang_kb())
             try:
-                await message.answer(" ", reply_markup=ReplyKeyboardRemove())
+                await bot.send_message(uid, LANG_PROMPT_RU, reply_markup=make_lang_kb())
+                await bot.send_message(uid, " ", reply_markup=ReplyKeyboardRemove())
             except Exception:
-                pass
+                await message.answer(LANG_PROMPT_RU, reply_markup=make_lang_kb())
             return
 
+    # ----------------- normal propose flow -----------------
     await ensure_user_row(uid)
     row = await get_user(uid)
     in_propose = row["in_propose"] if row else False
@@ -769,9 +829,8 @@ async def handle_any_message(message: types.Message):
     declined2 = row2["declined_count"] if row2 else 0
     welcome = WELCOME_UK.format(rep=rep2, accepted=accepted2, declined=declined2) if lang == "uk" else WELCOME_RU.format(rep=rep2, accepted=accepted2, declined=declined2)
     try:
-        await bot.send_message(uid, welcome, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-        prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
-        await bot.send_message(uid, prompt, reply_markup=persistent_reply_kb(lang))
+        await bot.send_message(uid, welcome, reply_markup=persistent_reply_kb(lang), parse_mode="HTML")
+        await bot.send_message(uid, "Меню:", reply_markup=main_menu_kb(lang))
     except Exception:
         pass
 
@@ -1105,61 +1164,6 @@ async def cb_info(call: types.CallbackQuery):
     )
     await call.answer(info_text, show_alert=True)
 
-# ---------- Разбан команда в группе PREDLOJKA_ID ----------
-@dp.message()
-async def unban_command_in_group(message: types.Message):
-    # This handler only handles messages that look like "разбан <id_or_username>" in the PREDLOJKA_ID group
-    if message.chat is None or PREDLOJKA_ID is None:
-        return
-    if message.chat.id != PREDLOJKA_ID:
-        return
-    if not message.text:
-        return
-    text = message.text.strip()
-    # accept both "разбан 123" and "/разбан 123" and Latin variants
-    if not (text.startswith("разбан ") or text.startswith("/разбан ") or text.startswith("razban ") or text.startswith("/razban ")):
-        return
-    parts = text.split(None, 1)
-    if len(parts) < 2:
-        await message.reply("Укажите пользователя по @юзернейму или ID. Пример: разбан 123456789")
-        return
-    target = parts[1].strip()
-    # resolve target id
-    target_id = None
-    if target.startswith("@"):
-        try:
-            chat = await bot.get_chat(target)
-            target_id = chat.id
-        except Exception:
-            target_id = None
-    else:
-        # try parse int
-        try:
-            target_id = int(target)
-        except Exception:
-            # fallback: maybe a username without @
-            try:
-                chat = await bot.get_chat("@" + target)
-                target_id = chat.id
-            except Exception:
-                target_id = None
-    if target_id is None:
-        await message.reply("Не удалось определить пользователя. Укажите корректный @юзернейм или числовой ID.")
-        return
-    # perform unban in DB
-    try:
-        await set_banned_until(target_id, 0)
-    except Exception:
-        await message.reply("Ошибка при записи в базу. Попробуйте позже.")
-        return
-    # notify in group
-    await message.reply(f"Пользователь {target} (ID {target_id}) разбанен в предложке.")
-    # try to notify user
-    try:
-        await bot.send_message(target_id, "Вас разбанили в системе предложений постов. Вы снова можете предлагать посты.")
-    except Exception:
-        pass
-
 # ---------- Background unban notifier ----------
 async def unban_watcher():
     while True:
@@ -1240,6 +1244,9 @@ def entities_to_html(text: str, entities: Optional[List[MessageEntity]]) -> str:
     if last < len(text):
         parts.append(escape_html(text[last:]))
     return "".join(parts)
+
+# ---------- Load command module early (optional) ----------
+# command.py will be used for /info and разбан; we import lazily inside handlers above.
 
 # ---------- START ----------
 async def main():
