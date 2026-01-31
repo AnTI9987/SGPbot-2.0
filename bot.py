@@ -1,5 +1,5 @@
 # bot.py
-# Full bot with propose system + /info + rep title toggles + fixes
+# Full bot with propose system + delegation to command.py for /info + persistent keyboard fixes
 
 import asyncio
 import os
@@ -18,7 +18,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
-    ChatMemberAdministrator
+    ChatMemberAdministrator,
 )
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
@@ -431,7 +431,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ---------- HELPERS specific to rep-title behavior ----------
-
 async def has_rep_title(bot: Bot, user_id: int) -> bool:
     if CHAT_ID is None:
         return False
@@ -500,8 +499,7 @@ async def remove_rep_title_and_demote(bot: Bot, user_id: int):
     if CHAT_ID is None:
         return False
     try:
-        # There isn't a direct 'demote' method; promote_chat_member with all False often removes admin,
-        # but to be safe we'll try set_chat_administrator_custom_title to empty if allowed, otherwise try to promote false.
+        # try to clear custom_title
         try:
             await bot.set_chat_administrator_custom_title(chat_id=CHAT_ID, user_id=user_id, custom_title="")
         except Exception:
@@ -537,10 +535,16 @@ async def cmd_start(message: types.Message):
         accepted = row["accepted_count"]
         declined = row["declined_count"]
         text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
-        # show inline main menu + persistent reply keyboard
-        await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-        prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
-        await message.answer(prompt, reply_markup=persistent_reply_kb(lang))
+        # show main menu AND persistent reply keyboard so button appears in bottom panel
+        try:
+            await bot.send_message(message.from_user.id, text, parse_mode="HTML", reply_markup=persistent_reply_kb(lang))
+        except Exception:
+            # fallback
+            await message.answer(text, parse_mode="HTML")
+        try:
+            await bot.send_message(message.from_user.id, "Меню:", reply_markup=main_menu_kb(lang))
+        except Exception:
+            pass
         return
 
     prompt = LANG_PROMPT_UK if (row and row.get("lang") == "uk") else LANG_PROMPT_RU
@@ -553,6 +557,7 @@ async def cb_set_lang(call: types.CallbackQuery):
     user_id = call.from_user.id
     await ensure_user_row(user_id)
     await set_user_lang(user_id, lang)
+    # delete selection message
     try:
         await call.message.delete()
     except Exception:
@@ -563,24 +568,43 @@ async def cb_set_lang(call: types.CallbackQuery):
     accepted = row["accepted_count"] if row else 0
     declined = row["declined_count"] if row else 0
     text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
-    await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-    prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
+
+    # send welcome using bot.send_message to ensure persistent keyboard is shown in client
     try:
-        await call.message.answer(prompt, reply_markup=persistent_reply_kb(lang))
+        await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=persistent_reply_kb(lang))
+    except Exception:
+        try:
+            await call.message.answer(text, parse_mode="HTML")
+        except Exception:
+            pass
+
+    # send inline main menu as separate message so persistent keyboard remains visible
+    try:
+        await bot.send_message(user_id, "Меню:", reply_markup=main_menu_kb(lang))
     except Exception:
         pass
 
 @dp.callback_query(F.data == "main:lang")
 async def cb_main_change_lang(call: types.CallbackQuery):
     await call.answer()
+    # remove persistent reply keyboard while changing language (use send_message to ensure it updates)
     try:
-        await call.message.answer(" ", reply_markup=ReplyKeyboardRemove())
+        await bot.send_message(call.from_user.id, "Смена языка...", reply_markup=ReplyKeyboardRemove())
     except Exception:
-        pass
+        try:
+            await call.message.answer("Смена языка...", reply_markup=ReplyKeyboardRemove())
+        except Exception:
+            pass
     row = await get_user(call.from_user.id)
     lang = row["lang"] if (row and row.get("lang")) else "ru"
     prompt = LANG_PROMPT_UK if lang == "uk" else LANG_PROMPT_RU
-    await call.message.answer(prompt, reply_markup=make_lang_kb())
+    try:
+        await bot.send_message(call.from_user.id, prompt, reply_markup=make_lang_kb())
+    except Exception:
+        try:
+            await call.message.answer(prompt, reply_markup=make_lang_kb())
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "main:propose")
 async def cb_main_propose(call: types.CallbackQuery):
@@ -615,12 +639,14 @@ async def cb_propose_cancel(call: types.CallbackQuery):
     except Exception:
         pass
     text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
-    await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
-    prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
     try:
-        await call.message.answer(prompt, reply_markup=persistent_reply_kb(lang))
+        await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=persistent_reply_kb(lang))
+        await bot.send_message(user_id, "Меню:", reply_markup=main_menu_kb(lang))
     except Exception:
-        pass
+        try:
+            await call.message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
+        except Exception:
+            pass
 
 @dp.callback_query(F.data == "main:support")
 async def cb_main_support(call: types.CallbackQuery):
@@ -643,6 +669,23 @@ async def cb_main_support(call: types.CallbackQuery):
 async def handle_any_message(message: types.Message):
     user = message.from_user
     uid = user.id
+
+    # --- Delegate /info and text variants to command.py ---
+    if message.text:
+        txt = message.text.strip()
+        txt_lower = txt.lower()
+        if txt_lower.startswith("/info") or txt_lower in ("инфо", "інфо", "информация", "інформація"):
+            try:
+                import command
+                await command.info_cmd(message)
+            except Exception:
+                # fallback
+                try:
+                    await message.reply("инфо")
+                except Exception:
+                    pass
+            return
+
     # reply keyboard text handling
     if message.text:
         txt = message.text.strip()
@@ -654,7 +697,14 @@ async def handle_any_message(message: types.Message):
             accepted = row["accepted_count"] if row else 0
             declined = row["declined_count"] if row else 0
             text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
-            await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
+            try:
+                await bot.send_message(uid, text, parse_mode="HTML", reply_markup=persistent_reply_kb(lang))
+                await bot.send_message(uid, "Меню:", reply_markup=main_menu_kb(lang))
+            except Exception:
+                try:
+                    await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
+                except Exception:
+                    pass
             return
         if txt in ("🖼️ Предложить пост", "🖼️ Запропонувати пост"):
             await ensure_user_row(uid)
@@ -662,7 +712,13 @@ async def handle_any_message(message: types.Message):
             lang = row["lang"] if row else "ru"
             await set_in_propose(uid, True)
             prompt = PROPOSE_PROMPT_UK if lang == "uk" else PROPOSE_PROMPT_RU
-            await message.answer(prompt, reply_markup=cancel_kb(lang))
+            try:
+                await bot.send_message(uid, prompt, reply_markup=cancel_kb(lang))
+            except Exception:
+                try:
+                    await message.answer(prompt, reply_markup=cancel_kb(lang))
+                except Exception:
+                    pass
             return
         if txt in ("📩 Поддержка", "📩 Підтримка"):
             try:
@@ -674,11 +730,12 @@ async def handle_any_message(message: types.Message):
                 await message.answer(text)
             return
         if txt in ("🗣️ Сменить язык", "🗣️ Змінити мову"):
-            await message.answer(LANG_PROMPT_RU, reply_markup=make_lang_kb())
+            # remove persistent reply keyboard and show language selection
             try:
-                await message.answer(" ", reply_markup=ReplyKeyboardRemove())
+                await bot.send_message(uid, LANG_PROMPT_RU, reply_markup=make_lang_kb())
+                await bot.send_message(uid, " ", reply_markup=ReplyKeyboardRemove())
             except Exception:
-                pass
+                await message.answer(LANG_PROMPT_RU, reply_markup=make_lang_kb())
             return
 
     await ensure_user_row(uid)
@@ -1135,84 +1192,6 @@ async def cb_info(call: types.CallbackQuery):
     )
     await call.answer(info_text, show_alert=True)
 
-# ---------- /info command and related callbacks ----------
-def user_link_markdown(user: types.User) -> str:
-    name = user.full_name or str(user.id)
-    # markdown supports tg://openmessage?user_id link via HTML; we'll use HTML to be consistent
-    return f'<a href="tg://openmessage?user_id={user.id}">{escape_html(name)}</a>'
-
-def info_card_text(lang: str, user: types.User, rep: int, accepted: int, has_title: bool) -> str:
-    if lang == "uk":
-        header = f"📊 Статистика по постах {user_link_markdown(user)}"
-        body = f"\n\n🆙 Ваша репутація: {rep}\n✅ Прийнятих постів: {accepted}\n\n"
-        if has_title:
-            body += "Натисніть кнопку нижче, щоб сховати відображення своєї репутації поруч з нікнеймом"
-        else:
-            body += "Натисніть кнопку нижче, щоб встановити відображення своєї репутації поруч з нікнеймом"
-        return f"{header}\n{body}"
-    else:
-        header = f"📊 Статистика по постам {user_link_markdown(user)}"
-        body = f"\n\n🆙 Ваша репутация: {rep}\n✅ Принятых постов: {accepted}\n\n"
-        if has_title:
-            body += "Нажмите кнопку ниже, чтобы скрыть отображение своей репутации рядом с никнеймом"
-        else:
-            body += "Нажмите кнопку ниже, чтобы установить отображение своей репутации рядом с никнеймом"
-        return f"{header}\n{body}"
-
-def info_card_kb(lang: str, user_id: int, has_title: bool) -> InlineKeyboardMarkup:
-    if lang == "uk":
-        btn_text = "👀 Сховати репутацію" if has_title else "👀 Відобразити репутацію"
-    else:
-        btn_text = "👀 Скрыть репутацию" if has_title else "👀 Отобразить репутацию"
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, callback_data=f"toggle_rep:{user_id}")]])
-
-@dp.message(Command("info"))
-@dp.message(F.text.lower().in_({"инфо", "інфо", "информация", "інформація"}))
-async def cmd_info_entry(message: types.Message):
-    user = message.from_user
-    await ensure_user_row(user.id)
-    row = await get_user(user.id)
-    lang = row["lang"] if row else "ru"
-    rep = row["reputation"] if row else 0
-    accepted = row["accepted_count"] if row else 0
-    has_title_now = await has_rep_title(bot, user.id)
-    text = info_card_text(lang, user, rep, accepted, has_title_now)
-    await message.answer(text, parse_mode="HTML", reply_markup=info_card_kb(lang, user.id, has_title_now))
-
-@dp.callback_query(F.data.startswith("toggle_rep:"))
-async def cb_toggle_rep(call: types.CallbackQuery):
-    await call.answer()
-    parts = call.data.split(":")
-    target_id = int(parts[1])
-    user = call.from_user
-    if user.id != target_id:
-        await call.answer("❌ Это не ваша кнопка", show_alert=True)
-        return
-    # check current
-    row = await get_user(user.id)
-    lang = row["lang"] if row else "ru"
-    rep = row["reputation"] if row else 0
-    has = await has_rep_title(bot, user.id)
-    if not has:
-        # show min-rep check
-        if rep < 25:
-            msg = "❌ Вы не можете отобразить свою репутацию если у Вас меньше 25-ти балов репутации" if lang != "uk" else "❌ Ви не можете відобразити свою репутацію, якщо у Вас менше 25 балів репутації"
-            await call.answer(msg, show_alert=True)
-            return
-        ok = await grant_rep_title_bot_admin(bot, user.id, rep)
-        if ok:
-            msg = "➕ Вы установили отображение репутации рядом со своим никнеймом." if lang != "uk" else "➕ Ви встановили відображення репутації поруч зі своїм нікнеймом."
-            await call.answer(msg, show_alert=True)
-        else:
-            await call.answer("Ошибка при установке отображения. Обратитесь к администратору.", show_alert=True)
-    else:
-        ok = await remove_rep_title_and_demote(bot, user.id)
-        if ok:
-            msg = "➖ Преписка с вашей репутацией была убрана из отображения рядом с вашим никнеймом." if lang != "uk" else "➖ Приписка з вашою репутацією була видалена з відображення поруч із вашим нікнейком."
-            await call.answer(msg, show_alert=True)
-        else:
-            await call.answer("Не удалось убрать отображение. Обратитесь к администратору.", show_alert=True)
-
 # ---------- Разбан команда (в группе PREDLOJKA_ID) ----------
 @dp.message()
 async def unban_command_in_group(message: types.Message):
@@ -1349,6 +1328,13 @@ async def main():
         await start_health_server()
     except Exception as e:
         print(f"[health] failed to start health server: {e}")
+
+    # attempt to import command module early so its background tasks / registrations may run
+    try:
+        import command  # noqa: F401
+    except Exception:
+        # we'll still call it lazily from handlers when needed
+        pass
 
     asyncio.create_task(unban_watcher())
     try:
