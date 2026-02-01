@@ -1,9 +1,10 @@
 # bot.py
 # Full bot with propose system + /info + rep title toggles + fixes
-# Changes:
-# - send accepted text posts to CHANNEL_ID with disable_web_page_preview=True (links stay, preview hidden)
-# - ensure callback handler for "info:" works
-# - final info-button after decline shows the penalty (0 or -1) in its label
+# Changes made:
+# - Delegation of /info and text-variants to command.py (imported at runtime inside handlers)
+# - Delegation of "разбан"/"razban"/"/разбан" to command.py.unban_cmd
+# - disable_web_page_preview=True used when sending text posts to PREDLOJKA and to CHANNEL_ID (hides link preview but keeps links)
+# - info final button shows penalty in label for decline (e.g. "<0>" or "<-1>")
 
 import asyncio
 import os
@@ -433,6 +434,130 @@ async def safe_edit_message_replace(bot: Bot, chat_id: int, message_id: int, new
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# ---------- Delegated handlers to command.py ----------
+# These are placed before the generic handler to ensure they run.
+@dp.message(Command("info"))
+async def delegated_info_cmd(message: types.Message):
+    # Delegate /info to command.info_cmd
+    try:
+        import command as cmd  # import at runtime to avoid circular import at module import time
+        if hasattr(cmd, "info_cmd"):
+            await cmd.info_cmd(message)
+            return
+    except Exception:
+        # fallback to internal if command.py missing / error
+        pass
+    # fallback internal behavior (kept minimal)
+    user = message.from_user
+    await ensure_user_row(user.id)
+    row = await get_user(user.id)
+    lang = row["lang"] if row else "ru"
+    rep = row["reputation"] if row else 0
+    accepted = row["accepted_count"] if row else 0
+    has_title_now = await has_rep_title(bot, user.id)
+    text = info_card_text(lang, user, rep, accepted, has_title_now)
+    await message.answer(text, parse_mode="HTML", reply_markup=info_card_kb(lang, user.id, has_title_now))
+
+@dp.message(F.text.lower().in_({"инфо", "інфо", "информация", "інформація"}))
+async def delegated_info_text_variants(message: types.Message):
+    # Delegate text variants to command.info_cmd
+    try:
+        import command as cmd
+        if hasattr(cmd, "info_cmd"):
+            await cmd.info_cmd(message)
+            return
+    except Exception:
+        pass
+    # fallback internal
+    user = message.from_user
+    await ensure_user_row(user.id)
+    row = await get_user(user.id)
+    lang = row["lang"] if row else "ru"
+    rep = row["reputation"] if row else 0
+    accepted = row["accepted_count"] if row else 0
+    has_title_now = await has_rep_title(bot, user.id)
+    text = info_card_text(lang, user, rep, accepted, has_title_now)
+    await message.answer(text, parse_mode="HTML", reply_markup=info_card_kb(lang, user.id, has_title_now))
+
+@dp.message()
+async def delegated_unban_cmd(message: types.Message):
+    # Check if this is a razban/unban invocation and delegate to command.unban_cmd.
+    if message.chat is None or not message.text:
+        return
+    text = message.text.strip()
+    lowered = text.lower()
+    if not (lowered.startswith("разбан ") or lowered.startswith("/разбан ") or lowered.startswith("razban ") or lowered.startswith("/razban ")):
+        return
+    # Ensure group restriction: delegate will also check, but short-circuit if PREDLOJKA_ID not set or mismatched.
+    try:
+        import command as cmd
+        if hasattr(cmd, "unban_cmd"):
+            await cmd.unban_cmd(message, bot, set_banned_until)
+            return
+    except Exception:
+        # fallback to internal implementation (kept for compatibility)
+        pass
+
+    # fallback internal (if command.py not available)
+    if PREDLOJKA_ID is None:
+        try:
+            await message.reply("PREDLOJKA_ID не настроен на сервере. Операция невозможна.")
+        except Exception:
+            pass
+        return
+    if message.chat.id != PREDLOJKA_ID:
+        try:
+            await message.reply("Команда разбан доступна только в группе предложки.")
+        except Exception:
+            pass
+        return
+    parts = text.split(None, 1)
+    if len(parts) < 2:
+        try:
+            await message.reply("Укажите пользователя по @юзернейму или ID. Пример: разбан 123456789")
+        except Exception:
+            pass
+        return
+    target = parts[1].strip()
+    target_id = None
+    if target.startswith("@"):
+        try:
+            chat = await bot.get_chat(target)
+            target_id = chat.id
+        except Exception:
+            target_id = None
+    else:
+        try:
+            target_id = int(target)
+        except Exception:
+            try:
+                chat = await bot.get_chat("@" + target)
+                target_id = chat.id
+            except Exception:
+                target_id = None
+    if target_id is None:
+        try:
+            await message.reply("Не удалось определить пользователя. Укажите корректный @юзернейм или числовой ID.")
+        except Exception:
+            pass
+        return
+    try:
+        await set_banned_until(target_id, 0)
+    except Exception:
+        try:
+            await message.reply("Ошибка при записи в базу. Попробуйте позже.")
+        except Exception:
+            pass
+        return
+    try:
+        await message.reply(f"Пользователь {target} (ID {target_id}) разбанен в предложке.")
+    except Exception:
+        pass
+    try:
+        await bot.send_message(target_id, "Вас разбанили в системе предложений постов. Вы снова можете предлагать посты.")
+    except Exception:
+        pass
+
 # ---------- HELPERS specific to rep-title behavior ----------
 
 async def has_rep_title(bot_inst: Bot, user_id: int) -> bool:
@@ -527,7 +652,7 @@ async def remove_rep_title_and_demote(bot_inst: Bot, user_id: int):
     except Exception:
         return False
 
-# ---------- HANDLERS ----------
+# ---------- HANDLERS (main flow) ----------
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -650,7 +775,7 @@ async def cb_main_support(call: types.CallbackQuery):
         except Exception:
             pass
 
-# while in propose mode: treat any incoming content as a post
+# ---------- while in propose mode: treat incoming content as a post ----------
 @dp.message()
 async def handle_any_message(message: types.Message):
     user = message.from_user
@@ -737,6 +862,7 @@ async def handle_any_message(message: types.Message):
     group_mod_msg_id = None
 
     try:
+        # send header (no preview issues here)
         header_sent = await bot.send_message(PREDLOJKA_ID, header_text, parse_mode="HTML")
         group_header_msg_id = header_sent.message_id
 
@@ -744,11 +870,12 @@ async def handle_any_message(message: types.Message):
             orig_text = message.text or ""
             html_text = entities_to_html(orig_text, message.entities or [])
             combined_html = f"{html_text}\n\n{APPENDED_LINKS_HTML}"
+            # IMPORTANT: disable_web_page_preview=True to hide link previews while keeping links
             sent = await bot.send_message(
                 PREDLOJKA_ID,
                 combined_html,
                 parse_mode="HTML",
-                disable_web_page_preview=True,  # hide preview in suggest-group too
+                disable_web_page_preview=True,
             )
             group_post_msg_id = sent.message_id
             attached = await safe_edit_message_replace(bot, PREDLOJKA_ID, group_post_msg_id, combined_html, mod_buttons_vertical(proposal_id))
@@ -848,10 +975,9 @@ async def cb_mod_actions(call: types.CallbackQuery):
     target_msg_id = call.message.message_id
 
     if action == "accept":
-        # --- CHANGED: send text to channel with disable_web_page_preview, keep copy_message for media ---
+        # --- send accepted text to channel without web previews, media via copy_message ---
         if CHANNEL_ID and prop.get("group_post_msg_id"):
             try:
-                # determine if message is plain-text
                 content_type = getattr(call.message, "content_type", None)
                 if content_type == ContentType.TEXT:
                     content = call.message.text or APPENDED_LINKS_HTML
@@ -1137,7 +1263,6 @@ async def cb_info(call: types.CallbackQuery):
     if action_key == "accept":
         action_label = "✅ Принять"
     elif action_key == "decline":
-        # show declined label with param preserved
         action_label = "❌ Отклонить"
     elif action_key == "ban":
         action_label = "🚫 Бан пользователя"
@@ -1170,7 +1295,7 @@ async def cb_info(call: types.CallbackQuery):
     )
     await call.answer(info_text, show_alert=True)
 
-# ---------- /info command and related callbacks ----------
+# ---------- /info helper functions kept for fallback ----------
 def user_link_markdown(user: types.User) -> str:
     name = user.full_name or str(user.id)
     return f'<a href="tg://openmessage?user_id={user.id}">{escape_html(name)}</a>'
@@ -1199,30 +1324,6 @@ def info_card_kb(lang: str, user_id: int, has_title: bool) -> InlineKeyboardMark
     else:
         btn_text = "👀 Скрыть репутацию" if has_title else "👀 Отобразить репутацию"
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, callback_data=f"toggle_rep:{user_id}")]])
-
-@dp.message(Command("info"))
-async def cmd_info_entry(message: types.Message):
-    user = message.from_user
-    await ensure_user_row(user.id)
-    row = await get_user(user.id)
-    lang = row["lang"] if row else "ru"
-    rep = row["reputation"] if row else 0
-    accepted = row["accepted_count"] if row else 0
-    has_title_now = await has_rep_title(bot, user.id)
-    text = info_card_text(lang, user, rep, accepted, has_title_now)
-    await message.answer(text, parse_mode="HTML", reply_markup=info_card_kb(lang, user.id, has_title_now))
-
-@dp.message(F.text.lower().in_({"инфо", "інфо", "информация", "інформація"}))
-async def cmd_info_text_variants(message: types.Message):
-    user = message.from_user
-    await ensure_user_row(user.id)
-    row = await get_user(user.id)
-    lang = row["lang"] if row else "ru"
-    rep = row["reputation"] if row else 0
-    accepted = row["accepted_count"] if row else 0
-    has_title_now = await has_rep_title(bot, user.id)
-    text = info_card_text(lang, user, rep, accepted, has_title_now)
-    await message.answer(text, parse_mode="HTML", reply_markup=info_card_kb(lang, user.id, has_title_now))
 
 @dp.callback_query(F.data.startswith("toggle_rep:"))
 async def cb_toggle_rep(call: types.CallbackQuery):
@@ -1257,53 +1358,6 @@ async def cb_toggle_rep(call: types.CallbackQuery):
             await call.answer(msg, show_alert=True)
         else:
             await call.answer("Не удалось убрать отображение. Обратитесь к администратору.", show_alert=True)
-
-# ---------- Разбан команда (в группе PREDLOJKA_ID) ----------
-@dp.message()
-async def unban_command_in_group(message: types.Message):
-    if message.chat is None or PREDLOJKA_ID is None:
-        return
-    if message.chat.id != PREDLOJKA_ID:
-        return
-    if not message.text:
-        return
-    text = message.text.strip()
-    if not (text.startswith("разбан ") or text.startswith("/разбан ") or text.startswith("razban ") or text.startswith("/razban ")):
-        return
-    parts = text.split(None, 1)
-    if len(parts) < 2:
-        await message.reply("Укажите пользователя по @юзернейму или ID. Пример: разбан 123456789")
-        return
-    target = parts[1].strip()
-    target_id = None
-    if target.startswith("@"):
-        try:
-            chat = await bot.get_chat(target)
-            target_id = chat.id
-        except Exception:
-            target_id = None
-    else:
-        try:
-            target_id = int(target)
-        except Exception:
-            try:
-                chat = await bot.get_chat("@" + target)
-                target_id = chat.id
-            except Exception:
-                target_id = None
-    if target_id is None:
-        await message.reply("Не удалось определить пользователя. Укажите корректный @юзернейм или числовой ID.")
-        return
-    try:
-        await set_banned_until(target_id, 0)
-    except Exception:
-        await message.reply("Ошибка при записи в базу. Попробуйте позже.")
-        return
-    await message.reply(f"Пользователь {target} (ID {target_id}) разбанен в предложке.")
-    try:
-        await bot.send_message(target_id, "Вас разбанили в системе предложений постов. Вы снова можете предлагать посты.")
-    except Exception:
-        pass
 
 # ---------- Background unban notifier ----------
 async def unban_watcher():
