@@ -1,6 +1,9 @@
 # bot.py
 # Full bot with propose system + /info + rep title toggles + fixes
-# Modified so that accepted text posts are sent to CHANNEL_ID without web page previews.
+# Changes:
+# - send accepted text posts to CHANNEL_ID with disable_web_page_preview=True (links stay, preview hidden)
+# - ensure callback handler for "info:" works
+# - final info-button after decline shows the penalty (0 or -1) in its label
 
 import asyncio
 import os
@@ -470,13 +473,13 @@ async def ensure_update_custom_title(bot_inst: Bot, user_id: int):
         # ignore failures silently
         pass
 
-async def grant_rep_title_bot_admin(bot: Bot, user_id: int, rep: int):
+async def grant_rep_title_bot_admin(bot_inst: Bot, user_id: int, rep: int):
     """Make user an admin with NO rights and set custom title 'Репутация: <rep>'."""
     if CHAT_ID is None:
         return False
     try:
         # promote with all rights False (user becomes admin but has no privileges)
-        await bot.promote_chat_member(
+        await bot_inst.promote_chat_member(
             chat_id=CHAT_ID,
             user_id=user_id,
             can_manage_chat=False,
@@ -490,12 +493,12 @@ async def grant_rep_title_bot_admin(bot: Bot, user_id: int, rep: int):
             can_invite_users=False,
             can_pin_messages=False,
         )
-        await bot.set_chat_administrator_custom_title(chat_id=CHAT_ID, user_id=user_id, custom_title=f"Репутация: {rep}")
+        await bot_inst.set_chat_administrator_custom_title(chat_id=CHAT_ID, user_id=user_id, custom_title=f"Репутация: {rep}")
         return True
     except Exception:
         return False
 
-async def remove_rep_title_and_demote(bot: Bot, user_id: int):
+async def remove_rep_title_and_demote(bot_inst: Bot, user_id: int):
     """Remove rep title by demoting user (remove admin status)."""
     if CHAT_ID is None:
         return False
@@ -503,10 +506,10 @@ async def remove_rep_title_and_demote(bot: Bot, user_id: int):
         # There isn't a direct 'demote' method; promote_chat_member with all False often removes admin,
         # but to be safe we'll try set_chat_administrator_custom_title to empty if allowed, otherwise try to promote false.
         try:
-            await bot.set_chat_administrator_custom_title(chat_id=CHAT_ID, user_id=user_id, custom_title="")
+            await bot_inst.set_chat_administrator_custom_title(chat_id=CHAT_ID, user_id=user_id, custom_title="")
         except Exception:
             # fallback: try promote with all False (may remove admin)
-            await bot.promote_chat_member(
+            await bot_inst.promote_chat_member(
                 chat_id=CHAT_ID,
                 user_id=user_id,
                 can_manage_chat=False,
@@ -531,7 +534,6 @@ async def cmd_start(message: types.Message):
     # enforce: /start should work only in private chats (ЛС)
     chat_type = getattr(message.chat, "type", None)
     if chat_type != "private":
-        # silently ignore or notify user — choose to notify so admins/users understand
         try:
             await message.reply("Команда /start доступна только в личных сообщениях с ботом.")
         except Exception:
@@ -746,7 +748,7 @@ async def handle_any_message(message: types.Message):
                 PREDLOJKA_ID,
                 combined_html,
                 parse_mode="HTML",
-                disable_web_page_preview=True,
+                disable_web_page_preview=True,  # hide preview in suggest-group too
             )
             group_post_msg_id = sent.message_id
             attached = await safe_edit_message_replace(bot, PREDLOJKA_ID, group_post_msg_id, combined_html, mod_buttons_vertical(proposal_id))
@@ -849,21 +851,18 @@ async def cb_mod_actions(call: types.CallbackQuery):
         # --- CHANGED: send text to channel with disable_web_page_preview, keep copy_message for media ---
         if CHANNEL_ID and prop.get("group_post_msg_id"):
             try:
-                # decide whether current message is text-like or media-like
-                # prefer call.message.caption (media captions) or call.message.text
-                # if the message content is text (ContentType.TEXT) -> send without preview
-                if getattr(call.message, "content_type", None) == ContentType.TEXT:
+                # determine if message is plain-text
+                content_type = getattr(call.message, "content_type", None)
+                if content_type == ContentType.TEXT:
                     content = call.message.text or APPENDED_LINKS_HTML
                     try:
                         await bot.send_message(chat_id=CHANNEL_ID, text=content, parse_mode="HTML", disable_web_page_preview=True)
                     except Exception:
-                        # fallback to copy if direct send fails
                         try:
                             await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
                         except Exception:
                             pass
                 else:
-                    # not a plain text message -> copy (keeps media)
                     try:
                         await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
                     except Exception:
@@ -920,7 +919,7 @@ async def cb_decline_penalty(call: types.CallbackQuery):
         return
 
     try:
-        penalty = int(arg)
+        penalty_idx = int(arg)  # 0 or 1
     except Exception:
         return
 
@@ -934,7 +933,9 @@ async def cb_decline_penalty(call: types.CallbackQuery):
 
     mod_id = call.from_user.id
 
-    if penalty == 0:
+    # Map index to penalized reputation delta shown on button
+    if penalty_idx == 0:
+        # penalty 0 -> no reputation change
         await set_proposal_status_and_mod(proposal_id, "declined", mod_id, "decline", "0")
         await increment_declined(user_id, 1)
         urow = await get_user(user_id)
@@ -947,13 +948,15 @@ async def cb_decline_penalty(call: types.CallbackQuery):
                 await bot.send_message(user_chat_id, text)
             except Exception:
                 pass
-        final_label = "❌ Отклонить"
+        # final label should include "<0>"
+        final_label = '❌ Отклонить <0>'
         try:
             await safe_edit_message_replace(bot, call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, final_choice_kb(final_label, proposal_id))
         except Exception:
             pass
         return
-    elif penalty == 1:
+    elif penalty_idx == 1:
+        # penalty 1 -> -1 reputation
         await add_reputation(user_id, -1)
         await set_proposal_status_and_mod(proposal_id, "declined", mod_id, "decline", "-1")
         await increment_declined(user_id, 1)
@@ -972,7 +975,7 @@ async def cb_decline_penalty(call: types.CallbackQuery):
                 await bot.send_message(user_chat_id, text)
             except Exception:
                 pass
-        final_label = "❌ Отклонить"
+        final_label = '❌ Отклонить <-1>'
         try:
             await safe_edit_message_replace(bot, call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, final_choice_kb(final_label, proposal_id))
         except Exception:
@@ -1088,8 +1091,10 @@ async def cb_rep_buttons(call: types.CallbackQuery):
     except Exception:
         pass
 
-@dp.callback_query(F.data and F.data.startswith("info:"))
+# ---------- Info callback: show details about proposal ----------
+@dp.callback_query(F.data.startswith("info:"))
 async def cb_info(call: types.CallbackQuery):
+    # unified info callback; should trigger when pressing the final_choice_kb button "ℹ️ Выбрано: ..."
     parts = call.data.split(":")
     proposal_id = int(parts[1]) if len(parts) > 1 else None
     if proposal_id is None:
@@ -1132,6 +1137,7 @@ async def cb_info(call: types.CallbackQuery):
     if action_key == "accept":
         action_label = "✅ Принять"
     elif action_key == "decline":
+        # show declined label with param preserved
         action_label = "❌ Отклонить"
     elif action_key == "ban":
         action_label = "🚫 Бан пользователя"
@@ -1167,12 +1173,11 @@ async def cb_info(call: types.CallbackQuery):
 # ---------- /info command and related callbacks ----------
 def user_link_markdown(user: types.User) -> str:
     name = user.full_name or str(user.id)
-    # markdown supports tg://openmessage?user_id link via HTML; we'll use HTML to be consistent
     return f'<a href="tg://openmessage?user_id={user.id}">{escape_html(name)}</a>'
 
 def info_card_text(lang: str, user: types.User, rep: int, accepted: int, has_title: bool) -> str:
     if lang == "uk":
-        header = f"📊 Статистика по постах {user_link_markdown(user)}"
+        header = f"📊 Статистика по постам {user_link_markdown(user)}"
         body = f"\n\n🆙 Ваша репутація: {rep}\n✅ Прийнятих постів: {accepted}\n\n"
         if has_title:
             body += "Натисніть кнопку нижче, щоб сховати відображення своєї репутації поруч з нікнейком"
@@ -1196,8 +1201,19 @@ def info_card_kb(lang: str, user_id: int, has_title: bool) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, callback_data=f"toggle_rep:{user_id}")]])
 
 @dp.message(Command("info"))
-@dp.message(F.text.lower().in_({"инфо", "інфо", "информация", "інформація"}))
 async def cmd_info_entry(message: types.Message):
+    user = message.from_user
+    await ensure_user_row(user.id)
+    row = await get_user(user.id)
+    lang = row["lang"] if row else "ru"
+    rep = row["reputation"] if row else 0
+    accepted = row["accepted_count"] if row else 0
+    has_title_now = await has_rep_title(bot, user.id)
+    text = info_card_text(lang, user, rep, accepted, has_title_now)
+    await message.answer(text, parse_mode="HTML", reply_markup=info_card_kb(lang, user.id, has_title_now))
+
+@dp.message(F.text.lower().in_({"инфо", "інфо", "информация", "інформація"}))
+async def cmd_info_text_variants(message: types.Message):
     user = message.from_user
     await ensure_user_row(user.id)
     row = await get_user(user.id)
