@@ -1,9 +1,9 @@
 # bot.py
 # Full bot with propose system + /info + rep title toggles + fixes
-# Changes:
-# - send accepted text posts to CHANNEL_ID with disable_web_page_preview=True (links stay, preview hidden)
-# - ensure callback handler for "info:" works (robust handling + error fallback)
-# - final info-button after decline shows the penalty (0 or -1) in its label
+# Key changes:
+# - text posts sent to PREDLOJKA_ID and CHANNEL_ID use disable_web_page_preview=True (links stay, previews hidden)
+# - info-button shows alert (call.answer with show_alert=True). Fallback to chat if alert fails.
+# - /info, text variants and разбан delegate to command.py (if available) with flexible call signatures
 
 import asyncio
 import os
@@ -436,7 +436,6 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ---------- HELPERS specific to rep-title behavior ----------
-
 async def has_rep_title(bot_inst: Bot, user_id: int) -> bool:
     if CHAT_ID is None:
         return False
@@ -750,7 +749,7 @@ async def handle_any_message(message: types.Message):
                 PREDLOJKA_ID,
                 combined_html,
                 parse_mode="HTML",
-                disable_web_page_preview=True,  # hide preview in suggest-group but keep links
+                disable_web_page_preview=True,  # hide preview (keep links)
             )
             group_post_msg_id = sent.message_id
             attached = await safe_edit_message_replace(bot, PREDLOJKA_ID, group_post_msg_id, combined_html, mod_buttons_vertical(proposal_id))
@@ -850,18 +849,15 @@ async def cb_mod_actions(call: types.CallbackQuery):
     target_msg_id = call.message.message_id
 
     if action == "accept":
-        # --- CHANGED: send text to channel with disable_web_page_preview, keep copy_message for media ---
+        # send text to channel with disable_web_page_preview, keep copy_message for media
         if CHANNEL_ID and prop.get("group_post_msg_id"):
             try:
-                # determine if message is plain-text
-                # try to get content from original group post (call.message may be the moderator's editing context)
                 content_type = getattr(call.message, "content_type", None)
                 if content_type == ContentType.TEXT:
                     content = call.message.text or APPENDED_LINKS_HTML
                     try:
                         await bot.send_message(chat_id=CHANNEL_ID, text=content, parse_mode="HTML", disable_web_page_preview=True)
                     except Exception:
-                        # fallback to copying the media/text from the proposed group post
                         try:
                             await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
                         except Exception:
@@ -1095,11 +1091,10 @@ async def cb_rep_buttons(call: types.CallbackQuery):
     except Exception:
         pass
 
-# ---------- Info callback: show details about proposal ----------
+# ---------- Info callback: show details about proposal (alert) ----------
 @dp.callback_query(F.data.startswith("info:"))
 async def cb_info(call: CallbackQuery):
     # unified info callback; should trigger when pressing the final_choice_kb button "ℹ️ Выбрано: ..."
-    # We'll attempt to show an alert. If that fails, fallback to sending the info into the chat.
     try:
         parts = call.data.split(":")
         proposal_id = int(parts[1]) if len(parts) > 1 else None
@@ -1154,7 +1149,6 @@ async def cb_info(call: CallbackQuery):
             banned_until = urow["banned_until"] if urow else 0
             rep_or_ban = f"Срок бана: {format_remaining(banned_until)}"
         else:
-            # show numeric param plainly (0 or -1 or other)
             try:
                 v = int(param)
                 rep_or_ban = f"Репутация: {v}"
@@ -1174,21 +1168,20 @@ async def cb_info(call: CallbackQuery):
             f"Действие: {action_label}\n"
             f"{rep_or_ban}"
         )
-        # Try to show as alert (ephemeral). If it fails (e.g. query already answered), fallback to chat message.
+        # Try to show as alert
         try:
             await call.answer(info_text, show_alert=True)
-        except TelegramBadRequest as e:
-            # fallback: reply in chat (non-ephemeral)
+        except TelegramBadRequest:
+            # fallback: reply in chat
             try:
                 await call.message.answer(info_text, parse_mode="HTML")
             except Exception:
-                # last resort: answer with short alert
                 try:
-                    await call.answer("Информация: открыта в чате.", show_alert=True)
+                    await call.answer("Информация недоступна.", show_alert=True)
                 except Exception:
                     pass
         except Exception as e:
-            # unexpected, print for debug and fallback
+            # fallback
             print(f"[cb_info] unexpected error: {e}")
             try:
                 await call.message.answer(info_text, parse_mode="HTML")
@@ -1198,14 +1191,13 @@ async def cb_info(call: CallbackQuery):
                 except Exception:
                     pass
     except Exception as outer_e:
-        # catch-all: log and try to inform user
         print(f"[cb_info] outer exception: {outer_e}")
         try:
             await call.answer("Ошибка при получении информации.", show_alert=True)
         except Exception:
             pass
 
-# ---------- /info command and related callbacks ----------
+# ---------- /info command & text variants: DELEGATE to command.py if present ----------
 def user_link_markdown(user: types.User) -> str:
     name = user.full_name or str(user.id)
     return f'<a href="tg://openmessage?user_id={user.id}">{escape_html(name)}</a>'
@@ -1236,7 +1228,22 @@ def info_card_kb(lang: str, user_id: int, has_title: bool) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, callback_data=f"toggle_rep:{user_id}")]])
 
 @dp.message(Command("info"))
-async def cmd_info_entry(message: types.Message):
+async def cmd_info_entry_delegate(message: types.Message):
+    # Prefer delegation to command.py: try to call command.info_cmd(message) or command.handle_info(message)
+    try:
+        import command as command_mod  # user-provided module
+        # try multiple possible function names
+        if hasattr(command_mod, "info_cmd"):
+            await command_mod.info_cmd(message)
+            return
+        if hasattr(command_mod, "handle_info"):
+            await command_mod.handle_info(message)
+            return
+    except Exception as e:
+        # import failed or function errored; log and fallback
+        print(f"[cmd_info_entry_delegate] command.py import/call error: {e}")
+
+    # fallback: internal behavior (same as previous local implementation)
     user = message.from_user
     await ensure_user_row(user.id)
     row = await get_user(user.id)
@@ -1248,7 +1255,20 @@ async def cmd_info_entry(message: types.Message):
     await message.answer(text, parse_mode="HTML", reply_markup=info_card_kb(lang, user.id, has_title_now))
 
 @dp.message(F.text.lower().in_({"инфо", "інфо", "информация", "інформація"}))
-async def cmd_info_text_variants(message: types.Message):
+async def cmd_info_text_variants_delegate(message: types.Message):
+    # Delegate to command.py if available
+    try:
+        import command as command_mod
+        if hasattr(command_mod, "info_cmd"):
+            await command_mod.info_cmd(message)
+            return
+        if hasattr(command_mod, "handle_info"):
+            await command_mod.handle_info(message)
+            return
+    except Exception as e:
+        print(f"[cmd_info_text_variants_delegate] command.py import/call error: {e}")
+
+    # fallback internal
     user = message.from_user
     await ensure_user_row(user.id)
     row = await get_user(user.id)
@@ -1263,7 +1283,11 @@ async def cmd_info_text_variants(message: types.Message):
 async def cb_toggle_rep(call: types.CallbackQuery):
     await call.answer()
     parts = call.data.split(":")
-    target_id = int(parts[1])
+    try:
+        target_id = int(parts[1])
+    except Exception:
+        await call.answer("Ошибка", show_alert=True)
+        return
     user = call.from_user
     if user.id != target_id:
         await call.answer("❌ Это не ваша кнопка", show_alert=True)
@@ -1293,9 +1317,10 @@ async def cb_toggle_rep(call: types.CallbackQuery):
         else:
             await call.answer("Не удалось убрать отображение. Обратитесь к администратору.", show_alert=True)
 
-# ---------- Разбан команда (в группе PREDLOJKA_ID) ----------
+# ---------- Разбан команда: DELEGATE to command.py if present ----------
 @dp.message()
-async def unban_command_in_group(message: types.Message):
+async def unban_command_delegate(message: types.Message):
+    # Only attempt when message appears to be a razban/разбан command (like previously)
     if message.chat is None or PREDLOJKA_ID is None:
         return
     if message.chat.id != PREDLOJKA_ID:
@@ -1305,6 +1330,37 @@ async def unban_command_in_group(message: types.Message):
     text = message.text.strip()
     if not (text.startswith("разбан ") or text.startswith("/разбан ") or text.startswith("razban ") or text.startswith("/razban ")):
         return
+
+    # Try to delegate to command.py
+    try:
+        import command as command_mod
+        # try multiple signatures gracefully
+        if hasattr(command_mod, "unban_cmd"):
+            fn = command_mod.unban_cmd
+            # try common possible signatures
+            try:
+                # preferred: (message, bot, set_banned_until_fn)
+                await fn(message, bot, set_banned_until)
+                return
+            except TypeError:
+                pass
+            try:
+                await fn(message, bot)
+                return
+            except TypeError:
+                pass
+            try:
+                await fn(message)
+                return
+            except Exception:
+                pass
+        if hasattr(command_mod, "handle_razban"):
+            await command_mod.handle_razban(message)
+            return
+    except Exception as e:
+        print(f"[unban_command_delegate] command.py import/call error: {e}")
+
+    # fallback: internal behavior (original implementation)
     parts = text.split(None, 1)
     if len(parts) < 2:
         await message.reply("Укажите пользователя по @юзернейму или ID. Пример: разбан 123456789")
