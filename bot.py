@@ -1,6 +1,7 @@
 # bot.py
 # Full bot with propose system + /info + rep title toggles + fixes
-# Modified to delegate "info" and "разбан" handling to command.py
+# Delegates /info and "разбан" handling to command.py dynamically.
+
 import asyncio
 import os
 import time
@@ -21,7 +22,6 @@ from aiogram.types import (
     ChatMemberAdministrator
 )
 from aiogram.filters import CommandStart, Command
-from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 
 # ---------- CONFIG ----------
@@ -437,7 +437,6 @@ async def has_rep_title(bot_inst: Bot, user_id: int) -> bool:
         return False
     try:
         member = await bot_inst.get_chat_member(CHAT_ID, user_id)
-        # check admin + custom title starting with "Репутация:"
         if isinstance(member, ChatMemberAdministrator):
             ct = getattr(member, "custom_title", None)
             if ct and str(ct).startswith("Репутация:"):
@@ -447,7 +446,6 @@ async def has_rep_title(bot_inst: Bot, user_id: int) -> bool:
         return False
 
 async def ensure_update_custom_title(bot_inst: Bot, user_id: int):
-    """If user currently has a rep-title in CHAT_ID, update it to current reputation."""
     if CHAT_ID is None:
         return
     try:
@@ -461,21 +459,16 @@ async def ensure_update_custom_title(bot_inst: Bot, user_id: int):
         return
     if not ct.startswith("Репутация:"):
         return
-    # fetch rep and update title
     rep = await get_user_reputation_db(user_id)
     try:
-        # set title; user must be an admin for this to work (they are)
         await bot_inst.set_chat_administrator_custom_title(chat_id=CHAT_ID, user_id=user_id, custom_title=f"Репутация: {rep}")
     except Exception:
-        # ignore failures silently
         pass
 
 async def grant_rep_title_bot_admin(bot_inst: Bot, user_id: int, rep: int):
-    """Make user an admin with NO rights and set custom title 'Репутация: <rep>'."""
     if CHAT_ID is None:
         return False
     try:
-        # promote with all rights False (user becomes admin but has no privileges)
         await bot_inst.promote_chat_member(
             chat_id=CHAT_ID,
             user_id=user_id,
@@ -496,16 +489,12 @@ async def grant_rep_title_bot_admin(bot_inst: Bot, user_id: int, rep: int):
         return False
 
 async def remove_rep_title_and_demote(bot_inst: Bot, user_id: int):
-    """Remove rep title by demoting user (remove admin status)."""
     if CHAT_ID is None:
         return False
     try:
-        # There isn't a direct 'demote' method; promote_chat_member with all False often removes admin,
-        # but to be safe we'll try set_chat_administrator_custom_title to empty if allowed, otherwise try to promote false.
         try:
             await bot_inst.set_chat_administrator_custom_title(chat_id=CHAT_ID, user_id=user_id, custom_title="")
         except Exception:
-            # fallback: try promote with all False (may remove admin)
             await bot_inst.promote_chat_member(
                 chat_id=CHAT_ID,
                 user_id=user_id,
@@ -528,10 +517,9 @@ async def remove_rep_title_and_demote(bot_inst: Bot, user_id: int):
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    # enforce: /start should work only in private chats (ЛС)
+    # only allow /start in private chat
     chat_type = getattr(message.chat, "type", None)
     if chat_type != "private":
-        # silently ignore or notify user — choose to notify so admins/users understand
         try:
             await message.reply("Команда /start доступна только в личных сообщениях с ботом.")
         except Exception:
@@ -547,7 +535,6 @@ async def cmd_start(message: types.Message):
         accepted = row["accepted_count"]
         declined = row["declined_count"]
         text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
-        # show inline main menu + persistent reply keyboard
         await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
         prompt = "Выберите действие:" if lang != "uk" else "Оберіть дію:"
         await message.answer(prompt, reply_markup=persistent_reply_kb(lang))
@@ -651,12 +638,12 @@ async def cb_main_support(call: types.CallbackQuery):
 # while in propose mode: treat any incoming content as a post
 @dp.message()
 async def handle_any_message(message: types.Message):
+    # First: handle reply-keyboard shortcuts and language/menu commands
     user = message.from_user
     uid = user.id
-    # reply keyboard text handling
     if message.text:
         txt = message.text.strip()
-        # map reply keyboard text to actions
+        # Menu
         if txt in ("📋 Меню", "📋 Меню"):
             row = await get_user(uid)
             lang = row["lang"] if row else "ru"
@@ -666,6 +653,8 @@ async def handle_any_message(message: types.Message):
             text = WELCOME_UK.format(rep=rep, accepted=accepted, declined=declined) if lang == "uk" else WELCOME_RU.format(rep=rep, accepted=accepted, declined=declined)
             await message.answer(text, reply_markup=main_menu_kb(lang), parse_mode="HTML")
             return
+
+        # Start propose via keyboard
         if txt in ("🖼️ Предложить пост", "🖼️ Запропонувати пост"):
             await ensure_user_row(uid)
             row = await get_user(uid)
@@ -674,6 +663,8 @@ async def handle_any_message(message: types.Message):
             prompt = PROPOSE_PROMPT_UK if lang == "uk" else PROPOSE_PROMPT_RU
             await message.answer(prompt, reply_markup=cancel_kb(lang))
             return
+
+        # Support
         if txt in ("📩 Поддержка", "📩 Підтримка"):
             try:
                 import bot2
@@ -683,6 +674,8 @@ async def handle_any_message(message: types.Message):
                 text = "Поддержка" if lang != "uk" else "Підтримка"
                 await message.answer(text)
             return
+
+        # Change language
         if txt in ("🗣️ Сменить язык", "🗣️ Змінити мову"):
             await message.answer(LANG_PROMPT_RU, reply_markup=make_lang_kb())
             try:
@@ -690,6 +683,95 @@ async def handle_any_message(message: types.Message):
             except Exception:
                 pass
             return
+
+    # Delegation: commands implemented in command.py
+    # Check for /info or text variants -> delegate to command.handle_info
+    if message.text:
+        low = message.text.strip().lower()
+        if low in ("/info", "инфо", "інфо", "информация", "інформація"):
+            try:
+                import command
+                await command.handle_info(message)
+            except Exception:
+                # fallback minimal info card
+                await ensure_user_row(uid)
+                row = await get_user(uid)
+                lang = row["lang"] if row else "ru"
+                rep = row["reputation"] if row else 0
+                accepted = row["accepted_count"] if row else 0
+                has_title_now = await has_rep_title(bot, uid)
+                text = (WELCOME_UK if lang == "uk" else WELCOME_RU).format(rep=rep, accepted=accepted, declined=(row["declined_count"] if row else 0))
+                try:
+                    await message.answer(text)
+                except Exception:
+                    pass
+            return
+
+        # razban delegation: only when message starts with razban keywords
+        tstr = message.text.strip()
+        if tstr.startswith("разбан ") or tstr.startswith("/разбан ") or tstr.startswith("razban ") or tstr.startswith("/razban "):
+            try:
+                import command
+                await command.handle_razban(message)
+            except Exception:
+                # fallback: old behaviour (minimal)
+                if message.chat is None or PREDLOJKA_ID is None:
+                    return
+                if message.chat.id != PREDLOJKA_ID:
+                    try:
+                        await message.reply("Команда разбан доступна только в группе предложки.")
+                    except Exception:
+                        pass
+                    return
+                parts = tstr.split(None, 1)
+                if len(parts) < 2:
+                    try:
+                        await message.reply("Укажите пользователя по @юзернейму или ID. Пример: разбан 123456789")
+                    except Exception:
+                        pass
+                    return
+                target = parts[1].strip()
+                target_id = None
+                if target.startswith("@"):
+                    try:
+                        chat = await bot.get_chat(target)
+                        target_id = chat.id
+                    except Exception:
+                        target_id = None
+                else:
+                    try:
+                        target_id = int(target)
+                    except Exception:
+                        try:
+                            chat = await bot.get_chat("@" + target)
+                            target_id = chat.id
+                        except Exception:
+                            target_id = None
+                if target_id is None:
+                    try:
+                        await message.reply("Не удалось определить пользователя. Укажите корректный @юзернейм или числовой ID.")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    await set_banned_until(target_id, 0)
+                except Exception:
+                    try:
+                        await message.reply("Ошибка при записи в базу. Попробуйте позже.")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    await message.reply(f"Пользователь {target} (ID {target_id}) разбанен в предложке.")
+                except Exception:
+                    pass
+                try:
+                    await bot.send_message(target_id, "Вас разбанили в системе предложений постов. Вы снова можете предлагать посты.")
+                except Exception:
+                    pass
+            return
+
+    # Otherwise, normal propose-mode handling below
 
     await ensure_user_row(uid)
     row = await get_user(uid)
@@ -715,7 +797,7 @@ async def handle_any_message(message: types.Message):
         await set_in_propose(uid, False)
         return
 
-    # header text (send as first message) using full name link and Russian month
+    # header text
     post_ts = int(time.time())
     hhmm = datetime.fromtimestamp(post_ts).strftime("%H:%M")
     human = human_date(post_ts)
@@ -938,7 +1020,6 @@ async def cb_decline_penalty(call: types.CallbackQuery):
         await add_reputation(user_id, -1)
         await set_proposal_status_and_mod(proposal_id, "declined", mod_id, "decline", "-1")
         await increment_declined(user_id, 1)
-        # update title if shown
         try:
             await ensure_update_custom_title(bot, user_id)
         except Exception:
@@ -1046,7 +1127,6 @@ async def cb_rep_buttons(call: types.CallbackQuery):
     await increment_accepted(user_id, 1)
     await set_proposal_status_and_mod(proposal_id, "published", call.from_user.id, "accept", str(rep_amount))
 
-    # update title if shown
     try:
         await ensure_update_custom_title(bot, user_id)
     except Exception:
@@ -1071,7 +1151,6 @@ async def cb_rep_buttons(call: types.CallbackQuery):
 
 @dp.callback_query(F.data and F.data.startswith("info:"))
 async def cb_info(call: types.CallbackQuery):
-    # keep original info callback (info:proposal_id) in-place — it was about proposal info
     parts = call.data.split(":")
     proposal_id = int(parts[1]) if len(parts) > 1 else None
     if proposal_id is None:
@@ -1146,47 +1225,15 @@ async def cb_info(call: types.CallbackQuery):
     )
     await call.answer(info_text, show_alert=True)
 
-# ---------- /info command and related callbacks ----------
-def user_link_markdown(user: types.User) -> str:
-    name = user.full_name or str(user.id)
-    # markdown supports tg://openmessage?user_id link via HTML; we'll use HTML to be consistent
-    return f'<a href="tg://openmessage?user_id={user.id}">{escape_html(name)}</a>'
-
-def info_card_text(lang: str, user: types.User, rep: int, accepted: int, has_title: bool) -> str:
-    if lang == "uk":
-        header = f"📊 Статистика по постах {user_link_markdown(user)}"
-        body = f"\n\n🆙 Ваша репутація: {rep}\n✅ Прийнятих постів: {accepted}\n\n"
-        if has_title:
-            body += "Натисніть кнопку нижче, щоб сховати відображення своєї репутації поруч з нікнеймом"
-        else:
-            body += "Натисніть кнопку нижче, щоб встановити відображення своєї репутації поруч з нікнейком"
-        return f"{header}\n{body}"
-    else:
-        header = f"📊 Статистика по постам {user_link_markdown(user)}"
-        body = f"\n\n🆙 Ваша репутация: {rep}\n✅ Принятых постов: {accepted}\n\n"
-        if has_title:
-            body += "Нажмите кнопку ниже, чтобы скрыть отображение своей репутации рядом с никнеймом"
-        else:
-            body += "Нажмите кнопку ниже, чтобы установить отображение своей репутации рядом с никнеймом"
-        return f"{header}\n{body}"
-
-def info_card_kb(lang: str, user_id: int, has_title: bool) -> InlineKeyboardMarkup:
-    if lang == "uk":
-        btn_text = "👀 Сховати репутацію" if has_title else "👀 Відобразити репутацію"
-    else:
-        btn_text = "👀 Скрыть репутацию" if has_title else "👀 Отобразить репутацию"
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=btn_text, callback_data=f"toggle_rep:{user_id}")]])
-
+# ---------- /info command (registered) ----------
 @dp.message(Command("info"))
-@dp.message(F.text.lower().in_({"инфо", "інфо", "информация", "інформація"}))
 async def cmd_info_entry(message: types.Message):
-    # Delegate the handling to command.py (it will run in same process)
-    # "info" should work both in private and in groups — that's allowed per request
+    # /info invoked explicitly: delegate to command.handle_info
     try:
         import command
         await command.handle_info(message)
     except Exception:
-        # fallback: try to run existing inline logic (minimal), to avoid breaking
+        # fallback: minimal info
         user = message.from_user
         await ensure_user_row(user.id)
         row = await get_user(user.id)
@@ -1194,8 +1241,21 @@ async def cmd_info_entry(message: types.Message):
         rep = row["reputation"] if row else 0
         accepted = row["accepted_count"] if row else 0
         has_title_now = await has_rep_title(bot, user.id)
-        text = info_card_text(lang, user, rep, accepted, has_title_now)
-        await message.answer(text, parse_mode="HTML", reply_markup=info_card_kb(lang, user.id, has_title_now))
+        text = (main_menu_kb(lang) and "Информация недоступна") if False else f"🆙 Репутация: {rep}\n✅ Принятых: {accepted}"
+        try:
+            await message.answer(text)
+        except Exception:
+            pass
+
+@dp.message(F.text.lower().in_({"инфо", "інфо", "информация", "інформація"}))
+async def cmd_info_text_variants(message: types.Message):
+    # text variants — delegate to command.handle_info
+    try:
+        import command
+        await command.handle_info(message)
+    except Exception:
+        # fallback: do nothing
+        pass
 
 @dp.callback_query(F.data.startswith("toggle_rep:"))
 async def cb_toggle_rep(call: types.CallbackQuery):
@@ -1206,13 +1266,11 @@ async def cb_toggle_rep(call: types.CallbackQuery):
     if user.id != target_id:
         await call.answer("❌ Это не ваша кнопка", show_alert=True)
         return
-    # check current
     row = await get_user(user.id)
     lang = row["lang"] if row else "ru"
     rep = row["reputation"] if row else 0
     has = await has_rep_title(bot, user.id)
     if not has:
-        # show min-rep check
         if rep < 25:
             msg = "❌ Вы не можете отобразить свою репутацию если у Вас меньше 25-ти балов репутации" if lang != "uk" else "❌ Ви не можете відобразити свою репутацію, якщо у Вас менше 25 балів репутації"
             await call.answer(msg, show_alert=True)
@@ -1231,63 +1289,8 @@ async def cb_toggle_rep(call: types.CallbackQuery):
         else:
             await call.answer("Не удалось убрать отображение. Обратитесь к администратору.", show_alert=True)
 
-# ---------- Разбан команда (в группе PREDLOJKA_ID) ----------
-@dp.message()
-async def unban_command_in_group(message: types.Message):
-    # Delegate handling of "разбан" to command.py; command.py will enforce that it only works in PREDLOJKA_ID
-    if not message.text:
-        return
-    text = message.text.strip()
-    if not (text.startswith("разбан ") or text.startswith("/разбан ") or text.startswith("razban ") or text.startswith("/razban ")):
-        return
-    try:
-        import command
-        await command.handle_razban(message)
-    except Exception:
-        # fallback: original behaviour (kept to avoid breaking)
-        if message.chat is None or PREDLOJKA_ID is None:
-            return
-        if message.chat.id != PREDLOJKA_ID:
-            return
-        if not message.text:
-            return
-        text = message.text.strip()
-        if not (text.startswith("разбан ") or text.startswith("/разбан ") or text.startswith("razban ") or text.startswith("/razban ")):
-            return
-        parts = text.split(None, 1)
-        if len(parts) < 2:
-            await message.reply("Укажите пользователя по @юзернейму или ID. Пример: разбан 123456789")
-            return
-        target = parts[1].strip()
-        target_id = None
-        if target.startswith("@"):
-            try:
-                chat = await bot.get_chat(target)
-                target_id = chat.id
-            except Exception:
-                target_id = None
-        else:
-            try:
-                target_id = int(target)
-            except Exception:
-                try:
-                    chat = await bot.get_chat("@" + target)
-                    target_id = chat.id
-                except Exception:
-                    target_id = None
-        if target_id is None:
-            await message.reply("Не удалось определить пользователя. Укажите корректный @юзернейм или числовой ID.")
-            return
-        try:
-            await set_banned_until(target_id, 0)
-        except Exception:
-            await message.reply("Ошибка при записи в базу. Попробуйте позже.")
-            return
-        await message.reply(f"Пользователь {target} (ID {target_id}) разбанен в предложке.")
-        try:
-            await bot.send_message(target_id, "Вас разбанили в системе предложений постов. Вы снова можете предлагать посты.")
-        except Exception:
-            pass
+# ---------- Разбан command handled via message handler delegation earlier ----------
+# (also there is still legacy unban_command_in_group but delegation is primary)
 
 # ---------- Background unban notifier ----------
 async def unban_watcher():
