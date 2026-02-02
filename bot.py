@@ -1177,6 +1177,7 @@ async def cb_rep_buttons(call: types.CallbackQuery):
 # ---------- Info callback: компактный alert (вмещаемся в лимит) ----------
 @dp.callback_query(F.data and F.data.startswith("info:"))
 async def cb_info(call: types.CallbackQuery):
+    # show an alert with info about proposal and moderator in the requested custom format
     parts = call.data.split(":")
     proposal_id = int(parts[1]) if len(parts) > 1 else None
     if proposal_id is None:
@@ -1187,14 +1188,24 @@ async def cb_info(call: types.CallbackQuery):
         await call.answer("Не найдена заявка.", show_alert=True)
         return
 
+    # get proposer and moderator info
     proposer_id = prop["user_id"]
     mod_id = prop["mod_id"]
 
-    # fetch proposer user (best-effort)
+    # fetch user info best-effort
+    def fmt_user_info(u: Optional[types.User]) -> Tuple[str, str, str]:
+        if not u:
+            return ("нет ника", "отсутствует", "—")
+        nick = getattr(u, "full_name", None) or (getattr(u, "first_name", "") + (" " + getattr(u, "last_name", "") if getattr(u, "last_name", None) else ""))
+        uname = f"@{u.username}" if getattr(u, "username", None) else "отсутствует"
+        uid = str(u.id)
+        return (nick, uname, uid)
+
     try:
         proposer = await bot.get_chat(proposer_id)
     except Exception:
         proposer = None
+    proposer_nick, proposer_uname, proposer_uid = fmt_user_info(proposer)
 
     if mod_id:
         try:
@@ -1203,62 +1214,43 @@ async def cb_info(call: types.CallbackQuery):
             moderator = None
     else:
         moderator = None
+    mod_nick, mod_uname, mod_uid = fmt_user_info(moderator)
 
-    def nick_and_username(u: Optional[types.User]) -> (str, str):
-        if not u:
-            return ("отсутствует", "отсутствует")
-        nick = u.full_name or str(u.id)
-        uname = f"@{u.username}" if getattr(u, "username", None) else "отсутствует"
-        return (nick, uname)
-
-    a_nick, a_uname = nick_and_username(proposer)
-    m_nick, m_uname = nick_and_username(moderator)
-
-    # determine action and param
-    action_key = prop["mod_action"] or "—"
+    action = prop["mod_action"] or "—"
     param = prop["mod_action_param"] or "—"
 
-    # build action label
+    # Map action strings to user-facing labels
     action_label = "—"
-    if action_key == "accept":
+    if action == "accept":
         action_label = "✅ Принять"
-    elif action_key == "decline":
+    elif action == "decline":
         action_label = "❌ Отклонить"
-    elif action_key == "ban":
+    elif action == "ban":
         action_label = "🚫 Бан пользователя"
     else:
-        action_label = action_key
+        action_label = action
 
-    # For reputation / ban display:
-    if action_key == "ban":
-        # fetch user's current banned_until to show remaining
-        urow = await get_user(proposer_id)
-        banned_until = urow["banned_until"] if urow else 0
-        rep_or_ban = f"Срок бана: {format_remaining(banned_until)}"
-    else:
-        # param may be like "-1" or "2" or "0"
-        # show with sign
-        try:
-            v = int(param)
-            rep_or_ban = f"Репутация: {v:+d}"
-        except Exception:
-            rep_or_ban = f"Репутация: {param}"
+    # reputation change (param is stringified number or "0" or None)
+    rep_change = param if param is not None else "—"
+    if rep_change not in {"-1", "0", "1", "2", "3"}:
+        # normalize: if accepted with param like "3" it's fine; if declined with "-1" it's fine.
+        rep_change = (f"+{rep_change}" if rep_change.isdigit() else rep_change)
 
-    # Construct final formatted info text per user's spec
     info_text = (
         f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
-        f"Ник: {escape_html(a_nick)}\n"
-        f"Юз: {a_uname}\n"
-        f"Айди: {proposer_id}\n\n"
-        f"🛡️ 𝗔𝗗𝗠𝗜𝗡\n"
-        f"Ник: {escape_html(m_nick)}\n"
-        f"Юз: {m_uname}\n"
-        f"Айди: {mod_id or '—'}\n\n"
+        f"Ник: {proposer_nick}\n"
+        f"Юз: {proposer_uname}\n"
+        f"Айди: {proposer_uid}\n\n"
+        f"🛡️ 𝗔𝗗𝗠𝗜Ｎ\n"
+        f"Ник: {mod_nick}\n"
+        f"Юз: {mod_uname}\n"
+        f"Айди: {mod_uid}\n\n"
         f"ℹ️ 𝗔𝗖𝗧𝗜𝗢𝗡\n"
         f"Действие: {action_label}\n"
-        f"{rep_or_ban}"
+        f"Репутация: {rep_change}"
     )
     await call.answer(info_text, show_alert=True)
+    
 
 # ---------- /info command (registered) ----------
 @dp.message(Command("info"))
