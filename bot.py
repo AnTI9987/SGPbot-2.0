@@ -108,8 +108,8 @@ UNBANNED_NOTICE_RU = "🔓 Срок Вашего бана в опции пред
 UNBANNED_NOTICE_UK = "🔓 Термін Вашого бану в опції пропозиції постів закінчився! Ви знову можете пропонувати свої пости."
 
 APPENDED_LINKS_HTML = (
-    '<a href="https://t.me/predlojka_gp_bot">Предложить пост</a>  •  '
-    '<a href="https://t.me/comments_gp_plavni">Чат</a>  •  '
+    '<a href="https://t.me/predlojka_gp_bot">Предложить пост</a> • '
+    '<a href="https://t.me/comments_gp_plavni">Чат</a> • '
     '<a href="https://t.me/boost/channel_gp_plavni">Буст</a>'
 )
 
@@ -928,11 +928,36 @@ async def cb_mod_actions(call: types.CallbackQuery):
     target_msg_id = call.message.message_id
 
     if action == "accept":
+        # If we have CHANNEL_ID and a recorded post message, try to post to channel.
+        # For text posts: send as text with disable_web_page_preview=True (so links remain but preview is hidden).
+        # For media / other types: fall back to copy_message.
         if CHANNEL_ID and prop.get("group_post_msg_id"):
             try:
-                await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
+                # If the moderator clicked the button on a text message, prefer send_message with preview disabled.
+                content_type = getattr(call.message, "content_type", None)
+                if content_type == ContentType.TEXT:
+                    # Use the message text (or APPENDED_LINKS_HTML) and ensure appended links are present.
+                    content = call.message.text or ""
+                    combined = f"{content}\n\n{APPENDED_LINKS_HTML}" if content else APPENDED_LINKS_HTML
+                    try:
+                        await bot.send_message(chat_id=CHANNEL_ID, text=combined, parse_mode="HTML", disable_web_page_preview=True)
+                    except Exception:
+                        # fallback: try copy_message (may fail if message was edited/removed)
+                        try:
+                            await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
+                        except Exception:
+                            pass
+                else:
+                    # For media / other message types, copy the message (preserves media)
+                    try:
+                        await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
+                    except Exception:
+                        pass
             except Exception:
+                # ignore channel-send errors
                 pass
+
+        # update DB state and show rep-buttons for moderators
         await set_proposal_status_and_mod(proposal_id, "accepted", None, "accept", None)
         try:
             await safe_edit_message_replace(bot, target_chat, target_msg_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, rep_buttons_vertical(proposal_id))
@@ -1160,6 +1185,15 @@ async def cb_info(call: types.CallbackQuery):
     if not prop:
         await call.answer("Не найдена заявка.", show_alert=True)
         return
+
+    # --- Ensure info callback is registered (fallback) ---
+# Some environments / decorator ordering can cause the decorated handler not to be active;
+# register explicitly as a fallback so button presses "info:..." are always handled.
+try:
+    dp.callback_query.register(cb_info, lambda c: c.data and c.data.startswith("info:"))
+except Exception:
+    # ignore registration errors (older aiogram versions / duplicate registration)
+    pass
 
     proposer_id = prop["user_id"]
     mod_id = prop["mod_id"]
