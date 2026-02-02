@@ -1177,13 +1177,11 @@ async def cb_rep_buttons(call: types.CallbackQuery):
 # ---------- Info callback: компактный alert (вмещаемся в лимит) ----------
 @dp.callback_query(F.data and F.data.startswith("info:"))
 async def cb_info(call: types.CallbackQuery):
-    # простой, прямой обработчик: формируем текст и пытаемся показать alert.
     parts = call.data.split(":")
     proposal_id = int(parts[1]) if len(parts) > 1 else None
     if proposal_id is None:
         await call.answer("Не найдена заявка.", show_alert=True)
         return
-
     prop = await get_proposal(proposal_id)
     if not prop:
         await call.answer("Не найдена заявка.", show_alert=True)
@@ -1192,16 +1190,21 @@ async def cb_info(call: types.CallbackQuery):
     proposer_id = prop["user_id"]
     mod_id = prop["mod_id"]
 
+    # fetch proposer user (best-effort)
     try:
         proposer = await bot.get_chat(proposer_id)
     except Exception:
         proposer = None
-    try:
-        moderator = await bot.get_chat(mod_id) if mod_id else None
-    except Exception:
+
+    if mod_id:
+        try:
+            moderator = await bot.get_chat(mod_id)
+        except Exception:
+            moderator = None
+    else:
         moderator = None
 
-    def nick_and_username(u: Optional[types.User]):
+    def nick_and_username(u: Optional[types.User]) -> (str, str):
         if not u:
             return ("отсутствует", "отсутствует")
         nick = u.full_name or str(u.id)
@@ -1211,26 +1214,37 @@ async def cb_info(call: types.CallbackQuery):
     a_nick, a_uname = nick_and_username(proposer)
     m_nick, m_uname = nick_and_username(moderator)
 
-    action_key = prop.get("mod_action") or "—"
-    param = prop.get("mod_action_param") or "—"
+    # determine action and param
+    action_key = prop["mod_action"] or "—"
+    param = prop["mod_action_param"] or "—"
 
+    # build action label
+    action_label = "—"
     if action_key == "accept":
         action_label = "✅ Принять"
     elif action_key == "decline":
-        # если в базе сохранён параметр -1 или 0 — отобразим в скобках
-        action_label = f'❌ Отклонить <{param}>' if str(param) != "—" else "❌ Отклонить"
+        action_label = "❌ Отклонить"
     elif action_key == "ban":
         action_label = "🚫 Бан пользователя"
     else:
         action_label = action_key
 
+    # For reputation / ban display:
     if action_key == "ban":
+        # fetch user's current banned_until to show remaining
         urow = await get_user(proposer_id)
         banned_until = urow["banned_until"] if urow else 0
         rep_or_ban = f"Срок бана: {format_remaining(banned_until)}"
     else:
-        rep_or_ban = f"Репутация: {param}"
+        # param may be like "-1" or "2" or "0"
+        # show with sign
+        try:
+            v = int(param)
+            rep_or_ban = f"Репутация: {v:+d}"
+        except Exception:
+            rep_or_ban = f"Репутация: {param}"
 
+    # Construct final formatted info text per user's spec
     info_text = (
         f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
         f"Ник: {escape_html(a_nick)}\n"
@@ -1244,36 +1258,7 @@ async def cb_info(call: types.CallbackQuery):
         f"Действие: {action_label}\n"
         f"{rep_or_ban}"
     )
-
-    # Попытка показать alert (окно на экране). Если Telegram вернёт
-    # MESSAGE_TOO_LONG — отправим тот же текст в чат как обычное сообщение.
-    try:
-        await call.answer(info_text, show_alert=True)
-    except TelegramBadRequest as e:
-        # если сообщение слишком длинное — fallback в чат
-        try:
-            if "MESSAGE_TOO_LONG" in str(e).upper():
-                # отправляем в чат (чтобы пользователь получил информацию)
-                try:
-                    await call.message.reply(info_text)
-                except Exception:
-                    # если и это не сработало — уведомим кратко
-                    await call.answer("Информация слишком длинная для всплывающего окна. Проверьте чат.", show_alert=True)
-            else:
-                # иная ошибка от Telegram — показываем краткий alert
-                await call.answer("Не удалось показать справку. Проверьте логи.", show_alert=True)
-        except Exception:
-            # молча игнорируем любые дополнительные ошибки
-            pass
-    except Exception:
-        # любой другой баг — попытка отправить в чат
-        try:
-            await call.message.reply(info_text)
-        except Exception:
-            try:
-                await call.answer("Не удалось показать справку.", show_alert=True)
-            except Exception:
-                pass
+    await call.answer(info_text, show_alert=True)
 
 # ---------- /info command (registered) ----------
 @dp.message(Command("info"))
