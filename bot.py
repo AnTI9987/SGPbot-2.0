@@ -1176,116 +1176,106 @@ async def cb_rep_buttons(call: types.CallbackQuery):
 
 # ---------- Info callback: компактный alert (вмещаемся в лимит) ----------
 
-@dp.callback_query(F.data.startswith("info:"))
-async def cb_info(call: CallbackQuery):
-    # unified info callback; should trigger when pressing the final_choice_kb button "ℹ️ Выбрано: ..."
-    # We'll attempt to show an alert. If that fails, fallback to sending the info into the chat.
+@dp.callback_query(F.data and F.data.startswith("info:"))
+async def cb_info(call: types.CallbackQuery):
+    # простой, прямой обработчик: формируем текст и пытаемся показать alert.
+    parts = call.data.split(":")
+    proposal_id = int(parts[1]) if len(parts) > 1 else None
+    if proposal_id is None:
+        await call.answer("Не найдена заявка.", show_alert=True)
+        return
+
+    prop = await get_proposal(proposal_id)
+    if not prop:
+        await call.answer("Не найдена заявка.", show_alert=True)
+        return
+
+    proposer_id = prop["user_id"]
+    mod_id = prop["mod_id"]
+
     try:
-        parts = call.data.split(":")
-        proposal_id = int(parts[1]) if len(parts) > 1 else None
-        if proposal_id is None:
-            await call.answer("Не найдена заявка.", show_alert=True)
-            return
-        prop = await get_proposal(proposal_id)
-        if not prop:
-            await call.answer("Не найдена заявка.", show_alert=True)
-            return
+        proposer = await bot.get_chat(proposer_id)
+    except Exception:
+        proposer = None
+    try:
+        moderator = await bot.get_chat(mod_id) if mod_id else None
+    except Exception:
+        moderator = None
 
-        proposer_id = prop["user_id"]
-        mod_id = prop["mod_id"]
+    def nick_and_username(u: Optional[types.User]):
+        if not u:
+            return ("отсутствует", "отсутствует")
+        nick = u.full_name or str(u.id)
+        uname = f"@{u.username}" if getattr(u, "username", None) else "отсутствует"
+        return (nick, uname)
 
+    a_nick, a_uname = nick_and_username(proposer)
+    m_nick, m_uname = nick_and_username(moderator)
+
+    action_key = prop.get("mod_action") or "—"
+    param = prop.get("mod_action_param") or "—"
+
+    if action_key == "accept":
+        action_label = "✅ Принять"
+    elif action_key == "decline":
+        # если в базе сохранён параметр -1 или 0 — отобразим в скобках
+        action_label = f'❌ Отклонить <{param}>' if str(param) != "—" else "❌ Отклонить"
+    elif action_key == "ban":
+        action_label = "🚫 Бан пользователя"
+    else:
+        action_label = action_key
+
+    if action_key == "ban":
+        urow = await get_user(proposer_id)
+        banned_until = urow["banned_until"] if urow else 0
+        rep_or_ban = f"Срок бана: {format_remaining(banned_until)}"
+    else:
+        rep_or_ban = f"Репутация: {param}"
+
+    info_text = (
+        f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
+        f"Ник: {escape_html(a_nick)}\n"
+        f"Юз: {a_uname}\n"
+        f"Айди: {proposer_id}\n\n"
+        f"🛡️ 𝗔𝗗𝗠𝗜𝗡\n"
+        f"Ник: {escape_html(m_nick)}\n"
+        f"Юз: {m_uname}\n"
+        f"Айди: {mod_id or '—'}\n\n"
+        f"ℹ️ 𝗔𝗖𝗧𝗜𝗢𝗡\n"
+        f"Действие: {action_label}\n"
+        f"{rep_or_ban}"
+    )
+
+    # Попытка показать alert (окно на экране). Если Telegram вернёт
+    # MESSAGE_TOO_LONG — отправим тот же текст в чат как обычное сообщение.
+    try:
+        await call.answer(info_text, show_alert=True)
+    except TelegramBadRequest as e:
+        # если сообщение слишком длинное — fallback в чат
         try:
-            proposer = await bot.get_chat(proposer_id)
-        except Exception:
-            proposer = None
-        if mod_id:
-            try:
-                moderator = await bot.get_chat(mod_id)
-            except Exception:
-                moderator = None
-        else:
-            moderator = None
-
-        def nick_and_username(u: Optional[types.User]) -> (str, str):
-            if not u:
-                return ("отсутствует", "отсутствует")
-            nick = u.full_name or str(u.id)
-            uname = f"@{u.username}" if getattr(u, "username", None) else "отсутствует"
-            return (nick, uname)
-
-        a_nick, a_uname = nick_and_username(proposer)
-        m_nick, m_uname = nick_and_username(moderator)
-
-        action_key = prop["mod_action"] or "—"
-        param = prop["mod_action_param"] or "—"
-
-        action_label = "—"
-        if action_key == "accept":
-            action_label = "✅ Принять"
-        elif action_key == "decline":
-            action_label = "❌ Отклонить"
-        elif action_key == "ban":
-            action_label = "🚫 Бан пользователя"
-        else:
-            action_label = action_key
-
-        if action_key == "ban":
-            urow = await get_user(proposer_id)
-            banned_until = urow["banned_until"] if urow else 0
-            rep_or_ban = f"Срок бана: {format_remaining(banned_until)}"
-        else:
-            # show numeric param plainly (0 or -1 or other)
-            try:
-                v = int(param)
-                rep_or_ban = f"Репутация: {v}"
-            except Exception:
-                rep_or_ban = f"Репутация: {param}"
-
-        info_text = (
-            f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
-            f"Ник: {escape_html(a_nick)}\n"
-            f"Юз: {a_uname}\n"
-            f"Айди: {proposer_id}\n\n"
-            f"🛡️ 𝗔𝗗𝗠𝗜𝗡\n"
-            f"Ник: {escape_html(m_nick)}\n"
-            f"Юз: {m_uname}\n"
-            f"Айди: {mod_id or '—'}\n\n"
-            f"ℹ️ 𝗔𝗖𝗧𝗜𝗢𝗡\n"
-            f"Действие: {action_label}\n"
-            f"{rep_or_ban}"
-        )
-        # Try to show as alert (ephemeral). If it fails (e.g. query already answered), fallback to chat message.
-        try:
-            await call.answer(info_text, show_alert=True)
-        except TelegramBadRequest as e:
-            # fallback: reply in chat (non-ephemeral)
-            try:
-                await call.message.answer(info_text, parse_mode="HTML")
-            except Exception:
-                # last resort: answer with short alert
+            if "MESSAGE_TOO_LONG" in str(e).upper():
+                # отправляем в чат (чтобы пользователь получил информацию)
                 try:
-                    await call.answer("Информация: открыта в чате.", show_alert=True)
+                    await call.message.reply(info_text)
                 except Exception:
-                    pass
-        except Exception as e:
-            # unexpected, print for debug and fallback
-            print(f"[cb_info] unexpected error: {e}")
-            try:
-                await call.message.answer(info_text, parse_mode="HTML")
-            except Exception:
-                try:
-                    await call.answer("Информация недоступна.", show_alert=True)
-                except Exception:
-                    pass
-    except Exception as outer_e:
-        # catch-all: log and try to inform user
-        print(f"[cb_info] outer exception: {outer_e}")
-        try:
-            await call.answer("Ошибка при получении информации.", show_alert=True)
+                    # если и это не сработало — уведомим кратко
+                    await call.answer("Информация слишком длинная для всплывающего окна. Проверьте чат.", show_alert=True)
+            else:
+                # иная ошибка от Telegram — показываем краткий alert
+                await call.answer("Не удалось показать справку. Проверьте логи.", show_alert=True)
         except Exception:
+            # молча игнорируем любые дополнительные ошибки
             pass
-    
-
+    except Exception:
+        # любой другой баг — попытка отправить в чат
+        try:
+            await call.message.reply(info_text)
+        except Exception:
+            try:
+                await call.answer("Не удалось показать справку.", show_alert=True)
+            except Exception:
+                pass
+                
 # ---------- /info command (registered) ----------
 @dp.message(Command("info"))
 async def cmd_info_entry(message: types.Message):
