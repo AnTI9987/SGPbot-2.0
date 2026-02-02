@@ -927,37 +927,64 @@ async def cb_mod_actions(call: types.CallbackQuery):
     target_chat = call.message.chat.id
     target_msg_id = call.message.message_id
 
-if action == "accept":
-        # --- ПАТЧ ---
-        # При одобрении: ПРЕФЕРЕНЦИАЛЬНО копируем сообщение из предложки в канал.
-        # Это гарантирует отсутствие двойного добавления APPENDED_LINKS_HTML.
+@dp.callback_query(F.data and F.data.startswith("mod:"))
+async def cb_mod_actions(call: types.CallbackQuery):
+    """
+    Handle mod actions: accept / decline / ban
+    Replace entire previous cb_mod_actions with this block (use consistent 4-space indentation).
+    """
+    await call.answer()
+    parts = call.data.split(":")
+    action = parts[1] if len(parts) > 1 else None
+    proposal_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+    if not proposal_id:
+        try:
+            await call.message.answer("Неверные данные.")
+        except Exception:
+            pass
+        return
+
+    prop = await get_proposal(proposal_id)
+    if not prop:
+        try:
+            await call.message.answer("Заявка не найдена.")
+        except Exception:
+            pass
+        return
+
+    target_chat = call.message.chat.id
+    target_msg_id = call.message.message_id
+
+    # --- ACCEPT ---
+    if action == "accept":
+        # Try to copy the exact message from предложка -> канал (preferred)
         try:
             if CHANNEL_ID and prop.get("group_post_msg_id"):
                 try:
-                    # Копируем ровно сообщение из группы предложки в канал.
                     await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
                 except Exception:
-                    # Если копирование упало — пробуем аккуратно отправить текст (если это текст).
+                    # fallback: if message is text-like, send the exact text/caption without APPENDED_LINKS_HTML
                     try:
-                        # Если у call.message есть текст/подпись, используем именно её (без добавления APPENDED_LINKS_HTML).
-                        # Отключаем preview, чтобы не показывать окно предпросмотра ссылок.
                         content = None
+                        # prefer text content for plain messages
                         if getattr(call.message, "content_type", None) == ContentType.TEXT:
                             content = call.message.text
                         else:
-                            # для медиасообщений подпись может быть в caption
                             content = getattr(call.message, "caption", None) or getattr(call.message, "text", None)
                         if content:
                             await bot.send_message(chat_id=CHANNEL_ID, text=content, parse_mode="HTML", disable_web_page_preview=True)
                     except Exception:
-                        # если всё упало — ничего не делаем (не критично)
                         pass
         except Exception:
-            # игнорируем внешние ошибки
+            # swallow external errors (we don't want to break mod flow)
             pass
 
-        # Обновляем статус в БД и показываем модерам кнопки выбора репутации
-        await set_proposal_status_and_mod(proposal_id, "accepted", None, "accept", None)
+        # Update DB and show rep choice buttons to moderators
+        try:
+            await set_proposal_status_and_mod(proposal_id, "accepted", None, "accept", None)
+        except Exception:
+            pass
+
         try:
             await safe_edit_message_replace(bot, target_chat, target_msg_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, rep_buttons_vertical(proposal_id))
         except Exception:
@@ -967,6 +994,7 @@ if action == "accept":
                 pass
         return
 
+    # --- DECLINE ---
     if action == "decline":
         try:
             await safe_edit_message_replace(bot, call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, decline_penalty_kb(proposal_id))
@@ -977,6 +1005,7 @@ if action == "accept":
                 pass
         return
 
+    # --- BAN ---
     if action == "ban":
         try:
             await safe_edit_message_replace(bot, call.message.chat.id, call.message.message_id, call.message.caption or call.message.text or APPENDED_LINKS_HTML, ban_duration_kb(proposal_id))
