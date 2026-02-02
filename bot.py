@@ -928,34 +928,41 @@ async def cb_mod_actions(call: types.CallbackQuery):
     target_msg_id = call.message.message_id
 
     if action == "accept":
-        # If we have CHANNEL_ID and a recorded post message, try to post to channel.
-        # For text posts: send as text with disable_web_page_preview=True (so links remain but preview is hidden).
-        # For media / other types: fall back to copy_message.
+        # Try to publish the proposal into the CHANNEL.
+        # Preferred: copy the message that already lives in PREDLOJKA (avoids duplication).
+        # Fallback: send text/caption manually but DO NOT append APPENDED_LINKS_HTML if it's already present.
         if CHANNEL_ID and prop.get("group_post_msg_id"):
             try:
-                # If the moderator clicked the button on a text message, prefer send_message with preview disabled.
-                content_type = getattr(call.message, "content_type", None)
-                if content_type == ContentType.TEXT:
-                    # Use the message text (or APPENDED_LINKS_HTML) and ensure appended links are present.
-                    content = call.message.text or ""
-                    combined = f"{content}\n\n{APPENDED_LINKS_HTML}" if content else APPENDED_LINKS_HTML
-                    try:
-                        await bot.send_message(chat_id=CHANNEL_ID, text=combined, parse_mode="HTML", disable_web_page_preview=True)
-                    except Exception:
-                        # fallback: try copy_message (may fail if message was edited/removed)
+                # try to copy the exact message (preserves media and text exactly as in PREDLOJKA)
+                await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
+            except Exception:
+                # copy failed -> fallback to sending text manually (for text posts or if copy not allowed)
+                try:
+                    # Prefer caption (for media) or text
+                    content = getattr(call.message, "caption", None) or getattr(call.message, "text", None) or ""
+                    if content:
+                        # If the links string already present (or keywords present), don't append again
+                        if (APPENDED_LINKS_HTML in content) or ("Предложить пост" in content) or ("Чат" in content) or ("Буст" in content):
+                            combined = content
+                        else:
+                            combined = f"{content}\n\n{APPENDED_LINKS_HTML}"
+                        try:
+                            await bot.send_message(chat_id=CHANNEL_ID, text=combined, parse_mode="HTML", disable_web_page_preview=True)
+                        except Exception:
+                            # final fallback: try a plain copy attempt again (best-effort)
+                            try:
+                                await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
+                            except Exception:
+                                pass
+                    else:
+                        # nothing to send — try to copy again and otherwise skip
                         try:
                             await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
                         except Exception:
                             pass
-                else:
-                    # For media / other message types, copy the message (preserves media)
-                    try:
-                        await bot.copy_message(chat_id=CHANNEL_ID, from_chat_id=PREDLOJKA_ID, message_id=prop["group_post_msg_id"])
-                    except Exception:
-                        pass
-            except Exception:
-                # ignore channel-send errors
-                pass
+                except Exception:
+                    # swallow any fallback exceptions
+                    pass
 
         # update DB state and show rep-buttons for moderators
         await set_proposal_status_and_mod(proposal_id, "accepted", None, "accept", None)
