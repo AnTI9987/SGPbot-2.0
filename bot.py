@@ -1178,9 +1178,9 @@ async def cb_rep_buttons(call: types.CallbackQuery):
 @dp.callback_query(F.data and F.data.startswith("info:"))
 async def cb_info(call: types.CallbackQuery):
     """
-    Показываем краткое, читаемое alert-окно (<=200 символов).
-    Если неожиданно Telegram всё же выдаст MESSAGE_TOO_LONG — делаем фолбэк:
-    короткое alert + отправляем полный текст в ЛС или как reply.
+    Показываем компактный alert (<=200 символов). При превышении длины —
+    сначала аккуратно укорачиваем, при неудаче: короткий alert + отправляем
+    полную информацию в ЛС администратора (фолбэк).
     """
     try:
         data = getattr(call, "data", "") or ""
@@ -1198,7 +1198,7 @@ async def cb_info(call: types.CallbackQuery):
         proposer_id = prop.get("user_id")
         mod_id = prop.get("mod_id")
 
-        # try to fetch proposer / moderator info (best-effort)
+        # best-effort fetch of users
         proposer = None
         moderator = None
         try:
@@ -1225,11 +1225,10 @@ async def cb_info(call: types.CallbackQuery):
         param = prop.get("mod_action_param")
         param = param if param is not None else "—"
 
-        # build action_label (preserve decline penalty formatting)
+        # build action_label (полезный формат для decline)
         if action_key == "accept":
             action_label = "✅ Принять"
         elif action_key == "decline":
-            # param may be "0" or "-1"
             try:
                 p_int = int(param)
                 action_label = f"❌ Отклонить <{p_int:+d}>"
@@ -1251,7 +1250,7 @@ async def cb_info(call: types.CallbackQuery):
             except Exception:
                 rep_or_ban = f"Репутация: {param}"
 
-        # Full info text (for DM / fallback if needed)
+        # Полный текст (фолбэк — отправляется в ЛС)
         full_info = (
             f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
             f"Ник: {escape_html(a_nick)}\n"
@@ -1266,8 +1265,7 @@ async def cb_info(call: types.CallbackQuery):
             f"{rep_or_ban}"
         )
 
-        # --- Build a readable concise alert (try to keep info, <=200 chars) ---
-        # Start with full human-friendly lines
+        # Собираем читаемый краткий alert
         lines = [
             f"Автор: {a_nick}" + (f" {a_uname}" if a_uname != "отсутствует" else ""),
             f"ID:{proposer_id}",
@@ -1281,14 +1279,9 @@ async def cb_info(call: types.CallbackQuery):
 
         concise = compose(lines)
 
-        # If too long -> progressively compress:
-        # 1) trim long names to max_name_len
-        # 2) if still too long -> drop usernames
-        # 3) if still too long -> use short labels (A:, M:, Act:)
-        # 4) if still too long -> hard truncate with ellipsis
+        # Сжатие при необходимости (максимум для alert)
         MAX_ALERT = 200
         if len(concise) > MAX_ALERT:
-            # shorten names
             max_name_len = 18
             a_nick_s = (a_nick[:max_name_len-1] + "…") if len(a_nick) > max_name_len else a_nick
             m_nick_s = (m_nick[:max_name_len-1] + "…") if len(m_nick) > max_name_len else m_nick
@@ -1304,7 +1297,6 @@ async def cb_info(call: types.CallbackQuery):
             concise = compose(lines)
 
         if len(concise) > MAX_ALERT:
-            # remove usernames
             lines = [
                 f"Автор: {a_nick_s}",
                 f"ID:{proposer_id}",
@@ -1315,7 +1307,6 @@ async def cb_info(call: types.CallbackQuery):
             concise = compose(lines)
 
         if len(concise) > MAX_ALERT:
-            # short labels
             lines = [
                 f"A:{a_nick_s}",
                 f"ID:{proposer_id}",
@@ -1323,24 +1314,22 @@ async def cb_info(call: types.CallbackQuery):
                 f"Act:{action_label}",
                 rep_or_ban
             ]
-            concise = " | ".join(lines)  # single-line compact form
+            concise = " | ".join(lines)
 
         if len(concise) > MAX_ALERT:
-            # final resort: hard truncate
             concise = concise[:(MAX_ALERT - 1)] + "…"
 
-        # Try to show alert
+        # Попытка показать alert
         try:
             await call.answer(concise, show_alert=True)
             return
         except TelegramBadRequest as e:
-            # unexpected: fallback to short alert + DM (safe)
-            print(f"[cb_info] alert failed: {e}; falling back to DM", flush=True)
+            # Если телеграм неожиданно жалуется — продолжим ниже в фолбэк
+            print(f"[cb_info] alert failed: {e}", flush=True)
 
-        # Fallback: short popup + send full info to user (DM) or as reply
+        # Фолбэк: короткий alert + отправка полного текста в ЛС вызывающему
         try:
             short_popup = f"Автор: {a_nick}\nДействие: {action_label}\n(полная инфо в личке)"
-            # ensure at most 200
             if len(short_popup) > MAX_ALERT:
                 short_popup = short_popup[:MAX_ALERT-1] + "…"
             try:
@@ -1351,12 +1340,11 @@ async def cb_info(call: types.CallbackQuery):
                 except Exception:
                     pass
 
-            # try DM
             try:
                 await bot.send_message(call.from_user.id, full_info, parse_mode="HTML")
                 return
             except Exception as e_dm:
-                print(f"[cb_info] DM failed: {e_dm}; will post in chat fallback", flush=True)
+                print(f"[cb_info] DM failed: {e_dm}", flush=True)
                 try:
                     await call.message.reply(full_info, parse_mode="HTML")
                 except Exception as e_reply:
