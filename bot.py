@@ -1234,11 +1234,9 @@ async def cb_info(call: types.CallbackQuery):
 
     info_text = (
         f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
-        f"Ник: {escape_html(a_nick)}\n"
         f"Юз: {a_uname}\n"
         f"Айди: {proposer_id}\n\n"
         f"🛡️ 𝗔𝗗𝗠𝗜𝗡\n"
-        f"Ник: {escape_html(m_nick)}\n"
         f"Юз: {m_uname}\n"
         f"Айди: {mod_id or '—'}\n\n"
         f"ℹ️ 𝗔𝗖𝗧𝗜𝗢𝗡\n"
