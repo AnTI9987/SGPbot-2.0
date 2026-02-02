@@ -1174,12 +1174,13 @@ async def cb_rep_buttons(call: types.CallbackQuery):
     except Exception:
         pass
 
-# ---------- Info callback: show details about proposal (robust version) ----------
+# ---------- Info callback: компактный alert (вмещаемся в лимит) ----------
 @dp.callback_query(F.data and F.data.startswith("info:"))
 async def cb_info(call: types.CallbackQuery):
     """
-    Show info about a proposal in an alert (so it appears as a popup).
-    Robust: catches exceptions, logs, always attempts to answer the callback.
+    Показываем краткое, читаемое alert-окно (<=200 символов).
+    Если неожиданно Telegram всё же выдаст MESSAGE_TOO_LONG — делаем фолбэк:
+    короткое alert + отправляем полный текст в ЛС или как reply.
     """
     try:
         data = getattr(call, "data", "") or ""
@@ -1197,7 +1198,7 @@ async def cb_info(call: types.CallbackQuery):
         proposer_id = prop.get("user_id")
         mod_id = prop.get("mod_id")
 
-        # safe fetch of chats/users (fail silently)
+        # try to fetch proposer / moderator info (best-effort)
         proposer = None
         moderator = None
         try:
@@ -1224,19 +1225,18 @@ async def cb_info(call: types.CallbackQuery):
         param = prop.get("mod_action_param")
         param = param if param is not None else "—"
 
-        # Build a nice action label; include penalty for decline
+        # build action_label (preserve decline penalty formatting)
         if action_key == "accept":
             action_label = "✅ Принять"
         elif action_key == "decline":
-            # param expected like "0" or "-1"
+            # param may be "0" or "-1"
             try:
                 p_int = int(param)
-                # format as "<0>" or "<-1>"
                 action_label = f"❌ Отклонить <{p_int:+d}>"
             except Exception:
                 action_label = "❌ Отклонить"
         elif action_key == "ban":
-            action_label = "🚫 Бан пользователя"
+            action_label = "🚫 Бан"
         else:
             action_label = str(action_key)
 
@@ -1251,41 +1251,129 @@ async def cb_info(call: types.CallbackQuery):
             except Exception:
                 rep_or_ban = f"Репутация: {param}"
 
-        info_text = (
+        # Full info text (for DM / fallback if needed)
+        full_info = (
             f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
             f"Ник: {escape_html(a_nick)}\n"
             f"Юз: {a_uname}\n"
-            f"Айди: {proposer_id}\n\n"
+            f"ID: {proposer_id}\n\n"
             f"🛡️ 𝗔𝗗𝗠𝗜𝗡\n"
             f"Ник: {escape_html(m_nick)}\n"
             f"Юз: {m_uname}\n"
-            f"Айди: {mod_id or '—'}\n\n"
+            f"ID: {mod_id or '—'}\n\n"
             f"ℹ️ 𝗔𝗖𝗧𝗜𝗢𝗡\n"
             f"Действие: {action_label}\n"
             f"{rep_or_ban}"
         )
 
-        # show as popup alert (so it doesn't post a new message)
-        await call.answer(info_text, show_alert=True)
-        return
+        # --- Build a readable concise alert (try to keep info, <=200 chars) ---
+        # Start with full human-friendly lines
+        lines = [
+            f"Автор: {a_nick}" + (f" {a_uname}" if a_uname != "отсутствует" else ""),
+            f"ID:{proposer_id}",
+            f"Админ: {m_nick}" + (f" {m_uname}" if m_uname != "отсутствует" else ""),
+            f"Действие: {action_label}",
+            rep_or_ban
+        ]
+
+        def compose(lines_list):
+            return "\n".join(filter(None, lines_list))
+
+        concise = compose(lines)
+
+        # If too long -> progressively compress:
+        # 1) trim long names to max_name_len
+        # 2) if still too long -> drop usernames
+        # 3) if still too long -> use short labels (A:, M:, Act:)
+        # 4) if still too long -> hard truncate with ellipsis
+        MAX_ALERT = 200
+        if len(concise) > MAX_ALERT:
+            # shorten names
+            max_name_len = 18
+            a_nick_s = (a_nick[:max_name_len-1] + "…") if len(a_nick) > max_name_len else a_nick
+            m_nick_s = (m_nick[:max_name_len-1] + "…") if len(m_nick) > max_name_len else m_nick
+            a_uname_s = a_uname if a_uname == "отсутствует" else (a_uname if len(a_uname) <= 15 else (a_uname[:14] + "…"))
+            m_uname_s = m_uname if m_uname == "отсутствует" else (m_uname if len(m_uname) <= 15 else (m_uname[:14] + "…"))
+            lines = [
+                f"Автор: {a_nick_s}" + (f" {a_uname_s}" if a_uname_s != "отсутствует" else ""),
+                f"ID:{proposer_id}",
+                f"Админ: {m_nick_s}" + (f" {m_uname_s}" if m_uname_s != "отсутствует" else ""),
+                f"Действие: {action_label}",
+                rep_or_ban
+            ]
+            concise = compose(lines)
+
+        if len(concise) > MAX_ALERT:
+            # remove usernames
+            lines = [
+                f"Автор: {a_nick_s}",
+                f"ID:{proposer_id}",
+                f"Админ: {m_nick_s}",
+                f"Действие: {action_label}",
+                rep_or_ban
+            ]
+            concise = compose(lines)
+
+        if len(concise) > MAX_ALERT:
+            # short labels
+            lines = [
+                f"A:{a_nick_s}",
+                f"ID:{proposer_id}",
+                f"M:{m_nick_s}",
+                f"Act:{action_label}",
+                rep_or_ban
+            ]
+            concise = " | ".join(lines)  # single-line compact form
+
+        if len(concise) > MAX_ALERT:
+            # final resort: hard truncate
+            concise = concise[:(MAX_ALERT - 1)] + "…"
+
+        # Try to show alert
+        try:
+            await call.answer(concise, show_alert=True)
+            return
+        except TelegramBadRequest as e:
+            # unexpected: fallback to short alert + DM (safe)
+            print(f"[cb_info] alert failed: {e}; falling back to DM", flush=True)
+
+        # Fallback: short popup + send full info to user (DM) or as reply
+        try:
+            short_popup = f"Автор: {a_nick}\nДействие: {action_label}\n(полная инфо в личке)"
+            # ensure at most 200
+            if len(short_popup) > MAX_ALERT:
+                short_popup = short_popup[:MAX_ALERT-1] + "…"
+            try:
+                await call.answer(short_popup, show_alert=True)
+            except Exception:
+                try:
+                    await call.answer()
+                except Exception:
+                    pass
+
+            # try DM
+            try:
+                await bot.send_message(call.from_user.id, full_info, parse_mode="HTML")
+                return
+            except Exception as e_dm:
+                print(f"[cb_info] DM failed: {e_dm}; will post in chat fallback", flush=True)
+                try:
+                    await call.message.reply(full_info, parse_mode="HTML")
+                except Exception as e_reply:
+                    print(f"[cb_info] fallback reply also failed: {e_reply}", flush=True)
+                    try:
+                        await call.answer("Не удалось доставить подробную информацию.", show_alert=True)
+                    except Exception:
+                        pass
+                return
 
     except Exception as exc:
-        # log to stdout (Render will show these lines in logs)
-        print(f"[cb_info] error: {exc}", flush=True)
-        # Try to inform user about error via popup
+        print(f"[cb_info] unexpected error: {exc}", flush=True)
         try:
-            await call.answer("Ошибка при получении информации. Проверьте логи.", show_alert=True)
+            await call.answer("Ошибка при получении информации.", show_alert=True)
         except Exception:
-            # last-resort: ignore
             pass
         return
-
-# --- Explicit fallback registration (guarantee handler is registered) ---
-try:
-    dp.callback_query.register(cb_info, lambda c: getattr(c, "data", None) and c.data.startswith("info:"))
-except Exception:
-    # ignore (possible duplicate registration or older aiogram)
-    pass
 
 # ---------- /info command (registered) ----------
 @dp.message(Command("info"))
