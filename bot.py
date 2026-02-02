@@ -1174,108 +1174,117 @@ async def cb_rep_buttons(call: types.CallbackQuery):
     except Exception:
         pass
 
-# ---------- Info callback: show details about proposal ----------
+# ---------- Info callback: show details about proposal (robust version) ----------
 @dp.callback_query(F.data and F.data.startswith("info:"))
 async def cb_info(call: types.CallbackQuery):
     """
     Show info about a proposal in an alert (so it appears as a popup).
-    This handler MUST be async and all awaits must be inside this function.
+    Robust: catches exceptions, logs, always attempts to answer the callback.
     """
-    parts = call.data.split(":")
-    proposal_id = int(parts[1]) if len(parts) > 1 else None
-    if proposal_id is None:
-        await call.answer("Не найдена заявка.", show_alert=True)
-        return
-
-    prop = await get_proposal(proposal_id)
-    if not prop:
-        await call.answer("Не найдена заявка.", show_alert=True)
-        return
-
-    proposer_id = prop["user_id"]
-    mod_id = prop["mod_id"]
-
-    # fetch chats safely
     try:
-        proposer = await bot.get_chat(proposer_id)
-    except Exception:
+        data = getattr(call, "data", "") or ""
+        parts = data.split(":", 1)
+        if len(parts) < 2 or not parts[1].strip().isdigit():
+            await call.answer("Не найдена заявка.", show_alert=True)
+            return
+
+        proposal_id = int(parts[1].strip())
+        prop = await get_proposal(proposal_id)
+        if not prop:
+            await call.answer("Не найдена заявка.", show_alert=True)
+            return
+
+        proposer_id = prop.get("user_id")
+        mod_id = prop.get("mod_id")
+
+        # safe fetch of chats/users (fail silently)
         proposer = None
-    if mod_id:
-        try:
-            moderator = await bot.get_chat(mod_id)
-        except Exception:
-            moderator = None
-    else:
         moderator = None
-
-    def nick_and_username(u: Optional[types.User]) -> (str, str):
-        if not u:
-            return ("отсутствует", "отсутствует")
-        nick = u.full_name or str(u.id)
-        uname = f"@{u.username}" if getattr(u, "username", None) else "отсутствует"
-        return (nick, uname)
-
-    a_nick, a_uname = nick_and_username(proposer)
-    m_nick, m_uname = nick_and_username(moderator)
-
-    action_key = prop.get("mod_action") or "—"
-    param = prop.get("mod_action_param") or "—"
-
-    # Build human-friendly action label (and include penalty for decline)
-    action_label = "—"
-    if action_key == "accept":
-        action_label = "✅ Принять"
-    elif action_key == "decline":
-        # include penalty param (0 or -1) in the label
         try:
-            # param is stored as string like "0" or "-1"
-            p_int = int(param)
-            action_label = f"❌ Отклонить <{p_int:+d}>"
+            proposer = await bot.get_chat(proposer_id)
         except Exception:
-            # fallback: just show decline
-            action_label = "❌ Отклонить"
-    elif action_key == "ban":
-        action_label = "🚫 Бан пользователя"
-    else:
-        action_label = action_key
+            proposer = None
+        if mod_id:
+            try:
+                moderator = await bot.get_chat(mod_id)
+            except Exception:
+                moderator = None
 
-    if action_key == "ban":
-        urow = await get_user(proposer_id)
-        banned_until = urow["banned_until"] if urow else 0
-        rep_or_ban = f"Срок бана: {format_remaining(banned_until)}"
-    else:
-        # show rep change; keep sign if numerical
+        def nick_and_username(u: Optional[types.User]) -> (str, str):
+            if not u:
+                return ("отсутствует", "отсутствует")
+            nick = u.full_name or str(u.id)
+            uname = f"@{u.username}" if getattr(u, "username", None) else "отсутствует"
+            return (nick, uname)
+
+        a_nick, a_uname = nick_and_username(proposer)
+        m_nick, m_uname = nick_and_username(moderator)
+
+        action_key = prop.get("mod_action") or "—"
+        param = prop.get("mod_action_param")
+        param = param if param is not None else "—"
+
+        # Build a nice action label; include penalty for decline
+        if action_key == "accept":
+            action_label = "✅ Принять"
+        elif action_key == "decline":
+            # param expected like "0" or "-1"
+            try:
+                p_int = int(param)
+                # format as "<0>" or "<-1>"
+                action_label = f"❌ Отклонить <{p_int:+d}>"
+            except Exception:
+                action_label = "❌ Отклонить"
+        elif action_key == "ban":
+            action_label = "🚫 Бан пользователя"
+        else:
+            action_label = str(action_key)
+
+        if action_key == "ban":
+            urow = await get_user(proposer_id)
+            banned_until = urow["banned_until"] if urow else 0
+            rep_or_ban = f"Срок бана: {format_remaining(banned_until)}"
+        else:
+            try:
+                v = int(param)
+                rep_or_ban = f"Репутация: {v:+d}"
+            except Exception:
+                rep_or_ban = f"Репутация: {param}"
+
+        info_text = (
+            f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
+            f"Ник: {escape_html(a_nick)}\n"
+            f"Юз: {a_uname}\n"
+            f"Айди: {proposer_id}\n\n"
+            f"🛡️ 𝗔𝗗𝗠𝗜𝗡\n"
+            f"Ник: {escape_html(m_nick)}\n"
+            f"Юз: {m_uname}\n"
+            f"Айди: {mod_id or '—'}\n\n"
+            f"ℹ️ 𝗔𝗖𝗧𝗜𝗢𝗡\n"
+            f"Действие: {action_label}\n"
+            f"{rep_or_ban}"
+        )
+
+        # show as popup alert (so it doesn't post a new message)
+        await call.answer(info_text, show_alert=True)
+        return
+
+    except Exception as exc:
+        # log to stdout (Render will show these lines in logs)
+        print(f"[cb_info] error: {exc}", flush=True)
+        # Try to inform user about error via popup
         try:
-            v = int(param)
-            rep_or_ban = f"Репутация: {v:+d}"
+            await call.answer("Ошибка при получении информации. Проверьте логи.", show_alert=True)
         except Exception:
-            rep_or_ban = f"Репутация: {param}"
+            # last-resort: ignore
+            pass
+        return
 
-    info_text = (
-        f"©️ 𝗔𝗨𝗧𝗛𝗢𝗥\n"
-        f"Ник: {escape_html(a_nick)}\n"
-        f"Юз: {a_uname}\n"
-        f"Айди: {proposer_id}\n\n"
-        f"🛡️ 𝗔𝗗𝗠𝗜𝗡\n"
-        f"Ник: {escape_html(m_nick)}\n"
-        f"Юз: {m_uname}\n"
-        f"Айди: {mod_id or '—'}\n\n"
-        f"ℹ️ 𝗔𝗖𝗧𝗜𝗢𝗡\n"
-        f"Действие: {action_label}\n"
-        f"{rep_or_ban}"
-    )
-
-    # show as popup alert (so it doesn't post a new message)
-    await call.answer(info_text, show_alert=True)
-
-# --- Explicit register below (fallback) ---
-# Some aiogram setups may not honor the decorator in unusual import orders;
-# register the same handler explicitly as a fallback to guarantee handling.
+# --- Explicit fallback registration (guarantee handler is registered) ---
 try:
-    # lambda used to match the same condition as decorator
     dp.callback_query.register(cb_info, lambda c: getattr(c, "data", None) and c.data.startswith("info:"))
 except Exception:
-    # ignore duplicate/old-aiogram registration errors
+    # ignore (possible duplicate registration or older aiogram)
     pass
 
 # ---------- /info command (registered) ----------
