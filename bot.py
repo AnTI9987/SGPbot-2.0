@@ -1174,30 +1174,28 @@ async def cb_rep_buttons(call: types.CallbackQuery):
     except Exception:
         pass
 
+# ---------- Info callback: show details about proposal ----------
 @dp.callback_query(F.data and F.data.startswith("info:"))
 async def cb_info(call: types.CallbackQuery):
+    """
+    Show info about a proposal in an alert (so it appears as a popup).
+    This handler MUST be async and all awaits must be inside this function.
+    """
     parts = call.data.split(":")
     proposal_id = int(parts[1]) if len(parts) > 1 else None
     if proposal_id is None:
         await call.answer("Не найдена заявка.", show_alert=True)
         return
+
     prop = await get_proposal(proposal_id)
     if not prop:
         await call.answer("Не найдена заявка.", show_alert=True)
         return
 
-    # --- Ensure info callback is registered (fallback) ---
-# Some environments / decorator ordering can cause the decorated handler not to be active;
-# register explicitly as a fallback so button presses "info:..." are always handled.
-try:
-    dp.callback_query.register(cb_info, lambda c: c.data and c.data.startswith("info:"))
-except Exception:
-    # ignore registration errors (older aiogram versions / duplicate registration)
-    pass
-
     proposer_id = prop["user_id"]
     mod_id = prop["mod_id"]
 
+    # fetch chats safely
     try:
         proposer = await bot.get_chat(proposer_id)
     except Exception:
@@ -1220,14 +1218,22 @@ except Exception:
     a_nick, a_uname = nick_and_username(proposer)
     m_nick, m_uname = nick_and_username(moderator)
 
-    action_key = prop["mod_action"] or "—"
-    param = prop["mod_action_param"] or "—"
+    action_key = prop.get("mod_action") or "—"
+    param = prop.get("mod_action_param") or "—"
 
+    # Build human-friendly action label (and include penalty for decline)
     action_label = "—"
     if action_key == "accept":
         action_label = "✅ Принять"
     elif action_key == "decline":
-        action_label = "❌ Отклонить"
+        # include penalty param (0 or -1) in the label
+        try:
+            # param is stored as string like "0" or "-1"
+            p_int = int(param)
+            action_label = f"❌ Отклонить <{p_int:+d}>"
+        except Exception:
+            # fallback: just show decline
+            action_label = "❌ Отклонить"
     elif action_key == "ban":
         action_label = "🚫 Бан пользователя"
     else:
@@ -1238,6 +1244,7 @@ except Exception:
         banned_until = urow["banned_until"] if urow else 0
         rep_or_ban = f"Срок бана: {format_remaining(banned_until)}"
     else:
+        # show rep change; keep sign if numerical
         try:
             v = int(param)
             rep_or_ban = f"Репутация: {v:+d}"
@@ -1257,7 +1264,19 @@ except Exception:
         f"Действие: {action_label}\n"
         f"{rep_or_ban}"
     )
+
+    # show as popup alert (so it doesn't post a new message)
     await call.answer(info_text, show_alert=True)
+
+# --- Explicit register below (fallback) ---
+# Some aiogram setups may not honor the decorator in unusual import orders;
+# register the same handler explicitly as a fallback to guarantee handling.
+try:
+    # lambda used to match the same condition as decorator
+    dp.callback_query.register(cb_info, lambda c: getattr(c, "data", None) and c.data.startswith("info:"))
+except Exception:
+    # ignore duplicate/old-aiogram registration errors
+    pass
 
 # ---------- /info command (registered) ----------
 @dp.message(Command("info"))
