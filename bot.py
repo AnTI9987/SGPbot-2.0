@@ -1,39 +1,41 @@
-# bot.py
 import asyncio
+import contextlib
 import html
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
     KeyboardButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
     Message,
     ReplyKeyboardMarkup,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
 )
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_ID = int(os.getenv("GROUP_ID", "0"))
-POST_CHAT_ID = int(os.getenv("POST_CHAT_ID", "0"))   # topic id for post submissions
-SUP_CHAT_ID = int(os.getenv("SUP_CHAT_ID", "0"))     # topic id for support
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+GROUP_ID = int(os.getenv("GROUP_ID", "0"))       # форум-группа
+POST_CHAT_ID = int(os.getenv("POST_CHAT_ID", "0"))  # тема для постов
+SUP_CHAT_ID = int(os.getenv("SUP_CHAT_ID", "0"))    # тема для поддержки
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))      # канал
 
 if not BOT_TOKEN or not GROUP_ID or not POST_CHAT_ID or not SUP_CHAT_ID or not CHANNEL_ID:
-    raise RuntimeError("Missing one of required env vars: BOT_TOKEN, GROUP_ID, POST_CHAT_ID, SUP_CHAT_ID, CHANNEL_ID")
+    raise RuntimeError(
+        "Missing one of required env vars: BOT_TOKEN, GROUP_ID, POST_CHAT_ID, SUP_CHAT_ID, CHANNEL_ID"
+    )
 
 router = Router()
-
 TZ = ZoneInfo("Europe/Zaporozhye")
 
 MAIN_TEXT = (
@@ -69,13 +71,12 @@ BAN_OPTIONS = [
     ("1 мес", 30 * 24 * 60 * 60),
     ("3 мес", 90 * 24 * 60 * 60),
 ]
-
 BAN_LABEL_BY_SECONDS = {seconds: label for label, seconds in BAN_OPTIONS}
 
 # In-memory state
-user_mode: Dict[int, str] = {}           # "post" | "support"
-user_bans: Dict[int, int] = {}           # user_id -> unix timestamp
-pending_posts: Dict[int, Dict[str, Any]] = {}  # moderation message_id -> record
+user_mode: Dict[int, str] = {}              # user_id -> "post" | "support"
+user_bans: Dict[int, int] = {}              # user_id -> unix timestamp
+pending_posts: Dict[int, Dict[str, Any]] = {}  # message_id in topic -> record
 
 
 def now_local() -> datetime:
@@ -90,11 +91,11 @@ def mention_html(user_id: int, full_name: str, username: Optional[str] = None) -
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
-def admin_mention_html(user) -> str:
+def user_mention_html(user) -> str:
     return mention_html(user.id, user.full_name, user.username)
 
 
-def user_mention_html(user) -> str:
+def admin_mention_html(user) -> str:
     return mention_html(user.id, user.full_name, user.username)
 
 
@@ -124,36 +125,28 @@ def get_post_body(message: Message) -> str:
     return "📎 Медиа"
 
 
+def get_message_kind(message: Message) -> str:
+    if message.text:
+        return "text"
+    if message.photo:
+        return "photo"
+    if message.video:
+        return "video"
+    return "other"
+
+
 def build_status_text(body: str, status_line: str) -> str:
     return f"{html.escape(body)}\n\n{status_line}"
 
 
 def build_channel_text(body: str) -> str:
-    footer = CHANNEL_FOOTER
-    if body:
-        text = html.escape(body) + "\n\n" + footer
-    else:
-        text = footer
-
-    if len(text) > 4096:
-        text = text[:4093] + "..."
-    return text
+    text = html.escape(body) + "\n\n" + CHANNEL_FOOTER
+    return text[:4096] if len(text) <= 4096 else text[:4093] + "..."
 
 
 def build_channel_caption(body: str) -> str:
-    footer = CHANNEL_FOOTER
-    if body:
-        caption = html.escape(body) + "\n\n" + footer
-    else:
-        caption = footer
-
-    if len(caption) > 1024:
-        caption = caption[:1021] + "..."
-    return caption
-
-
-def main_menu_text() -> str:
-    return MAIN_TEXT
+    caption = html.escape(body) + "\n\n" + CHANNEL_FOOTER
+    return caption[:1024] if len(caption) <= 1024 else caption[:1021] + "..."
 
 
 def post_action_kb() -> InlineKeyboardMarkup:
@@ -163,9 +156,7 @@ def post_action_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="✅ Принять", callback_data="post:accept"),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data="post:reject"),
             ],
-            [
-                InlineKeyboardButton(text="🚫 Заблокировать", callback_data="post:ban_menu"),
-            ],
+            [InlineKeyboardButton(text="🚫 Заблокировать", callback_data="post:ban_menu")],
         ]
     )
 
@@ -193,7 +184,7 @@ async def is_group_admin(bot: Bot, user_id: int) -> bool:
 
 
 async def send_main_menu(message: Message) -> None:
-    await message.answer(main_menu_text(), reply_markup=MAIN_KB)
+    await message.answer(MAIN_TEXT, reply_markup=MAIN_KB)
 
 
 async def send_post_prompt(message: Message) -> None:
@@ -202,6 +193,52 @@ async def send_post_prompt(message: Message) -> None:
 
 async def send_support_prompt(message: Message) -> None:
     await message.answer(SUPPORT_PROMPT, reply_markup=CANCEL_KB)
+
+
+async def send_submission_to_topic(
+    bot: Bot,
+    topic_id: int,
+    user,
+    source_message: Message,
+) -> int:
+    author_line = f"От {user_mention_html(user)} в {now_local().strftime('%H:%M')}"
+    header_msg = await bot.send_message(
+        chat_id=GROUP_ID,
+        message_thread_id=topic_id,
+        text=author_line,
+        disable_web_page_preview=True,
+    )
+
+    try:
+        copied = await bot.copy_message(
+            chat_id=GROUP_ID,
+            from_chat_id=source_message.chat.id,
+            message_id=source_message.message_id,
+            message_thread_id=topic_id,
+        )
+        return copied.message_id
+    except Exception:
+        with contextlib.suppress(Exception):
+            await bot.delete_message(chat_id=GROUP_ID, message_id=header_msg.message_id)
+        raise
+
+
+async def edit_topic_message_with_status(bot: Bot, msg: Message, status_line: str, body: str) -> None:
+    new_text = build_status_text(body, status_line)
+    if msg.text is not None:
+        await bot.edit_message_text(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            text=new_text,
+            reply_markup=None,
+        )
+    else:
+        await bot.edit_message_caption(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            caption=new_text,
+            reply_markup=None,
+        )
 
 
 async def publish_post_to_channel(bot: Bot, record: Dict[str, Any]) -> None:
@@ -213,63 +250,28 @@ async def publish_post_to_channel(bot: Bot, record: Dict[str, Any]) -> None:
         return
 
     if content_type == "photo":
-        caption = build_channel_caption(body)
         await bot.send_photo(
             CHANNEL_ID,
             photo=record["file_id"],
-            caption=caption,
+            caption=build_channel_caption(body),
         )
         return
 
     if content_type == "video":
-        caption = build_channel_caption(body)
         await bot.send_video(
             CHANNEL_ID,
             video=record["file_id"],
-            caption=caption,
+            caption=build_channel_caption(body),
         )
         return
 
-    # Fallback for any other content types
     await bot.send_message(CHANNEL_ID, build_channel_text(body))
-
-
-async def edit_topic_message_with_status(
-    bot: Bot,
-    msg: Message,
-    status_line: str,
-    body: str,
-) -> None:
-    new_text = build_status_text(body, status_line)
-    try:
-        if msg.text is not None:
-            await bot.edit_message_text(
-                chat_id=msg.chat.id,
-                message_id=msg.message_id,
-                text=new_text,
-                reply_markup=None,
-            )
-        else:
-            await bot.edit_message_caption(
-                chat_id=msg.chat.id,
-                message_id=msg.message_id,
-                caption=new_text,
-                reply_markup=None,
-            )
-    except TelegramBadRequest:
-        # If editing fails for any reason, try to at least remove the keyboard.
-        with contextlib.suppress(Exception):
-            await bot.edit_message_reply_markup(
-                chat_id=msg.chat.id,
-                message_id=msg.message_id,
-                reply_markup=None,
-            )
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     user_mode.pop(message.from_user.id, None)
-    await message.answer(main_menu_text(), reply_markup=MAIN_KB)
+    await send_main_menu(message)
 
 
 @router.message(F.text == "🖼️ Предложить пост")
@@ -285,8 +287,7 @@ async def enter_post_mode(message: Message) -> None:
                 f"🚫 Вы были заблокированы в предложке. Вы будете разблокированы через {format_remaining(remaining)}"
             )
             return
-        else:
-            user_bans.pop(user_id, None)
+        user_bans.pop(user_id, None)
 
     user_mode[user_id] = "post"
     await send_post_prompt(message)
@@ -301,7 +302,7 @@ async def enter_support_mode(message: Message) -> None:
 @router.message(F.text == "❌ Отменить")
 async def cancel_mode(message: Message) -> None:
     user_mode.pop(message.from_user.id, None)
-    await message.answer(main_menu_text(), reply_markup=MAIN_KB)
+    await send_main_menu(message)
 
 
 @router.message()
@@ -312,81 +313,102 @@ async def handle_user_content(message: Message, bot: Bot) -> None:
     if mode not in {"post", "support"}:
         return
 
-    # Post mode
     if mode == "post":
         banned_until = user_bans.get(user_id)
         now_ts = int(datetime.now(timezone.utc).timestamp())
         if banned_until and banned_until > now_ts:
             remaining = banned_until - now_ts
+            user_mode.pop(user_id, None)
             await message.answer(
                 f"🚫 Вы были заблокированы в предложке. Вы будете разблокированы через {format_remaining(remaining)}",
                 reply_markup=MAIN_KB,
             )
-            user_mode.pop(user_id, None)
             return
 
-        author = user_mention_html(message.from_user)
-        timestamp = now_local().strftime("%H:%M")
-        author_line = f"От {author} в {timestamp}"
-
-        author_msg = await bot.send_message(
-            GROUP_ID,
-            author_line,
-            message_thread_id=POST_CHAT_ID,
-            disable_web_page_preview=True,
-        )
-
-        copied = await bot.copy_message(
-            chat_id=GROUP_ID,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-            message_thread_id=POST_CHAT_ID,
-        )
-        copied_message_id = getattr(copied, "message_id", copied)
-
-        pending_posts[copied_message_id] = {
-            "user_id": user_id,
-            "author_message_id": author_msg.message_id,
-            "content_type": message.content_type,
-            "body": get_post_body(message),
-            "file_id": message.photo[-1].file_id if message.photo else None,
-            "video_file_id": message.video.file_id if message.video else None,
-            "source_chat_id": message.chat.id,
-            "source_message_id": message.message_id,
-        }
+        kind = get_message_kind(message)
+        if kind not in {"text", "photo", "video"}:
+            await message.answer(
+                "Отправьте текст, фото или видео.",
+                reply_markup=CANCEL_KB,
+            )
+            return
 
         try:
+            copied_message_id = await send_submission_to_topic(
+                bot=bot,
+                topic_id=POST_CHAT_ID,
+                user=message.from_user,
+                source_message=message,
+            )
+        except TelegramBadRequest as e:
+            logger.exception(
+                "Failed to send post to group/topic. Check GROUP_ID=%s, POST_CHAT_ID=%s, bot membership and topic access.",
+                GROUP_ID,
+                POST_CHAT_ID,
+            )
+            await message.answer(
+                "❌ Не удалось отправить пост в тему.\n"
+                "Проверь, что бот добавлен в форум-группу, что GROUP_ID верный и что POST_CHAT_ID указывает именно на тему для постов."
+            )
+            return
+        except Exception:
+            logger.exception("Unexpected error while sending post to topic")
+            await message.answer(
+                "❌ Произошла ошибка при отправке поста.",
+                reply_markup=MAIN_KB,
+            )
+            return
+
+        body = get_post_body(message)
+        pending_posts[copied_message_id] = {
+            "user_id": user_id,
+            "content_type": kind,
+            "body": body,
+            "file_id": message.photo[-1].file_id if message.photo else (message.video.file_id if message.video else None),
+        }
+
+        with contextlib.suppress(Exception):
             await bot.edit_message_reply_markup(
                 chat_id=GROUP_ID,
                 message_id=copied_message_id,
                 reply_markup=post_action_kb(),
             )
-        except TelegramBadRequest:
-            pass
 
         user_mode.pop(user_id, None)
         await message.answer("✅ Ваш пост принят на рассмотрение", reply_markup=MAIN_KB)
         return
 
-    # Support mode
     if mode == "support":
-        author = user_mention_html(message.from_user)
-        timestamp = now_local().strftime("%H:%M")
-        author_line = f"От {author} в {timestamp}"
+        kind = get_message_kind(message)
+        if kind not in {"text", "photo", "video"}:
+            await message.answer(
+                "Отправьте текст, фото или видео.",
+                reply_markup=CANCEL_KB,
+            )
+            return
 
-        await bot.send_message(
-            GROUP_ID,
-            author_line,
-            message_thread_id=SUP_CHAT_ID,
-            disable_web_page_preview=True,
-        )
-
-        await bot.copy_message(
-            chat_id=GROUP_ID,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-            message_thread_id=SUP_CHAT_ID,
-        )
+        try:
+            await send_submission_to_topic(
+                bot=bot,
+                topic_id=SUP_CHAT_ID,
+                user=message.from_user,
+                source_message=message,
+            )
+        except TelegramBadRequest:
+            logger.exception(
+                "Failed to send support message to group/topic. Check GROUP_ID=%s, SUP_CHAT_ID=%s, bot membership and topic access.",
+                GROUP_ID,
+                SUP_CHAT_ID,
+            )
+            await message.answer(
+                "❌ Не удалось отправить сообщение в поддержку.\n"
+                "Проверь, что бот добавлен в форум-группу, что GROUP_ID верный и что SUP_CHAT_ID указывает на тему поддержки."
+            )
+            return
+        except Exception:
+            logger.exception("Unexpected error while sending support message")
+            await message.answer("❌ Произошла ошибка при отправке сообщения.", reply_markup=MAIN_KB)
+            return
 
         user_mode.pop(user_id, None)
         await message.answer("✅ Ваше обращение отправлено в поддержку", reply_markup=MAIN_KB)
@@ -413,12 +435,12 @@ async def cb_post_accept(callback: CallbackQuery, bot: Bot) -> None:
     admin_link = admin_mention_html(callback.from_user)
     status_line = f"✅ Принято: {admin_link}"
 
-    try:
+    with contextlib.suppress(Exception):
         await edit_topic_message_with_status(bot, msg, status_line, body)
-    except Exception:
-        pass
 
-    await publish_post_to_channel(bot, record)
+    with contextlib.suppress(Exception):
+        await publish_post_to_channel(bot, record)
+
     await callback.answer("Принято")
 
 
@@ -442,10 +464,8 @@ async def cb_post_reject(callback: CallbackQuery, bot: Bot) -> None:
     admin_link = admin_mention_html(callback.from_user)
     status_line = f"❌ Отклонено: {admin_link}"
 
-    try:
+    with contextlib.suppress(Exception):
         await edit_topic_message_with_status(bot, msg, status_line, body)
-    except Exception:
-        pass
 
     await callback.answer("Отклонено")
 
@@ -465,14 +485,12 @@ async def cb_post_ban_menu(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Пост уже обработан", show_alert=True)
         return
 
-    try:
+    with contextlib.suppress(Exception):
         await bot.edit_message_reply_markup(
             chat_id=msg.chat.id,
             message_id=msg.message_id,
             reply_markup=ban_menu_kb(),
         )
-    except TelegramBadRequest:
-        pass
 
     await callback.answer()
 
@@ -492,14 +510,12 @@ async def cb_post_back(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer("Пост уже обработан", show_alert=True)
         return
 
-    try:
+    with contextlib.suppress(Exception):
         await bot.edit_message_reply_markup(
             chat_id=msg.chat.id,
             message_id=msg.message_id,
             reply_markup=post_action_kb(),
         )
-    except TelegramBadRequest:
-        pass
 
     await callback.answer()
 
@@ -535,19 +551,21 @@ async def cb_post_ban_duration(callback: CallbackQuery, bot: Bot) -> None:
     status_line = f"🚫 Бан на {label}: {admin_link}"
 
     body = record["body"]
-    try:
+    with contextlib.suppress(Exception):
         await edit_topic_message_with_status(bot, msg, status_line, body)
-    except Exception:
-        pass
 
     await callback.answer(f"Пользователь заблокирован на {label}")
 
 
 async def main() -> None:
+    logger.info("Starting bot with GROUP_ID=%s POST_CHAT_ID=%s SUP_CHAT_ID=%s CHANNEL_ID=%s",
+                GROUP_ID, POST_CHAT_ID, SUP_CHAT_ID, CHANNEL_ID)
+
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+
     dp = Dispatcher()
     dp.include_router(router)
     await dp.start_polling(bot)
