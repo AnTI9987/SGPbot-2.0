@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -29,6 +30,7 @@ GROUP_ID = int(os.getenv("GROUP_ID", "0"))       # форум-группа
 POST_CHAT_ID = int(os.getenv("POST_CHAT_ID", "0"))  # тема для постов
 SUP_CHAT_ID = int(os.getenv("SUP_CHAT_ID", "0"))    # тема для поддержки
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))      # канал
+PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN or not GROUP_ID or not POST_CHAT_ID or not SUP_CHAT_ID or not CHANNEL_ID:
     raise RuntimeError(
@@ -74,8 +76,8 @@ BAN_OPTIONS = [
 BAN_LABEL_BY_SECONDS = {seconds: label for label, seconds in BAN_OPTIONS}
 
 # In-memory state
-user_mode: Dict[int, str] = {}              # user_id -> "post" | "support"
-user_bans: Dict[int, int] = {}              # user_id -> unix timestamp
+user_mode: Dict[int, str] = {}                 # user_id -> "post" | "support"
+user_bans: Dict[int, int] = {}                 # user_id -> unix timestamp
 pending_posts: Dict[int, Dict[str, Any]] = {}  # message_id in topic -> record
 
 
@@ -268,6 +270,23 @@ async def publish_post_to_channel(bot: Bot, record: Dict[str, Any]) -> None:
     await bot.send_message(CHANNEL_ID, build_channel_text(body))
 
 
+async def start_web_server() -> web.AppRunner:
+    app = web.Application()
+
+    async def healthcheck(request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app.router.add_get("/", healthcheck)
+    app.router.add_get("/health", healthcheck)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    logger.info("Web server started on 0.0.0.0:%s", PORT)
+    return runner
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     user_mode.pop(message.from_user.id, None)
@@ -340,7 +359,7 @@ async def handle_user_content(message: Message, bot: Bot) -> None:
                 user=message.from_user,
                 source_message=message,
             )
-        except TelegramBadRequest as e:
+        except TelegramBadRequest:
             logger.exception(
                 "Failed to send post to group/topic. Check GROUP_ID=%s, POST_CHAT_ID=%s, bot membership and topic access.",
                 GROUP_ID,
@@ -402,7 +421,7 @@ async def handle_user_content(message: Message, bot: Bot) -> None:
             )
             await message.answer(
                 "❌ Не удалось отправить сообщение в поддержку.\n"
-                "Проверь, что бот добавлен в форум-группу, что GROUP_ID верный и что SUP_CHAT_ID указывает на тему поддержки."
+                "Проверь, что бот добавлен в форум-группу, что GROUP_ID верный и что SUP_CHAT_ID указывает именно на тему поддержки."
             )
             return
         except Exception:
@@ -558,8 +577,13 @@ async def cb_post_ban_duration(callback: CallbackQuery, bot: Bot) -> None:
 
 
 async def main() -> None:
-    logger.info("Starting bot with GROUP_ID=%s POST_CHAT_ID=%s SUP_CHAT_ID=%s CHANNEL_ID=%s",
-                GROUP_ID, POST_CHAT_ID, SUP_CHAT_ID, CHANNEL_ID)
+    logger.info(
+        "Starting bot with GROUP_ID=%s POST_CHAT_ID=%s SUP_CHAT_ID=%s CHANNEL_ID=%s",
+        GROUP_ID,
+        POST_CHAT_ID,
+        SUP_CHAT_ID,
+        CHANNEL_ID,
+    )
 
     bot = Bot(
         token=BOT_TOKEN,
@@ -568,7 +592,12 @@ async def main() -> None:
 
     dp = Dispatcher()
     dp.include_router(router)
-    await dp.start_polling(bot)
+
+    runner = await start_web_server()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
