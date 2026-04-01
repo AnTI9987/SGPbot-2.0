@@ -49,7 +49,7 @@ MAIN_TEXT = (
     "Здесь Вы можете предложить пост или обратиться в поддержку канала."
 )
 
-POST_PROMPT = "🫡 Предложите свой пост и мы проверим его в ближайшее время."
+POST_PROMPT = "🖼️ Предложите свой пост для канала. Это может быть видео, картинка или надпись."
 SUPPORT_PROMPT = "📥 Напишите ваше сообщение в поддержку."
 
 MAIN_KB = ReplyKeyboardMarkup(
@@ -82,7 +82,7 @@ BAN_LABEL_BY_SECONDS = {seconds: label for label, seconds in BAN_OPTIONS}
 # In-memory state
 user_mode: Dict[int, str] = {}                 # user_id -> "post" | "support"
 user_bans: Dict[int, int] = {}                 # user_id -> unix timestamp
-pending_posts: Dict[int, Dict[str, Any]] = {}  # first message_id in topic -> record
+pending_posts: Dict[int, Dict[str, Any]] = {}  # moderation message_id -> record
 media_group_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}  # (chat_id, media_group_id) -> buffer
 
 
@@ -284,11 +284,12 @@ async def send_submission_single_to_topic(
             sent = await bot.send_message(
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
-                text=(source_message.text or ""),
+                text=html.escape(source_message.text or ""),
                 link_preview_options=NO_PREVIEW,
             )
             sent_id = extract_message_id(sent)
-            return [sent_id], {
+
+            return sent_id, {
                 "kind": "single",
                 "content_type": "text",
                 "body": get_post_body(source_message),
@@ -313,7 +314,7 @@ async def send_submission_single_to_topic(
                 else source_message.video.file_id
             )
 
-            return [copied_id], {
+            return copied_id, {
                 "kind": "single",
                 "content_type": media_type,
                 "body": get_post_body(source_message),
@@ -329,6 +330,17 @@ async def send_submission_single_to_topic(
         with contextlib.suppress(Exception):
             await bot.delete_message(chat_id=GROUP_ID, message_id=header_msg.message_id)
         raise
+
+
+async def send_moderation_control_message(bot: Bot, topic_id: int) -> int:
+    control = await bot.send_message(
+        chat_id=GROUP_ID,
+        message_thread_id=topic_id,
+        text="🛠 Используйте кнопки ниже для модерации поста.",
+        reply_markup=post_action_kb(),
+        link_preview_options=NO_PREVIEW,
+    )
+    return extract_message_id(control)
 
 
 async def send_submission_album_to_topic(
@@ -370,6 +382,8 @@ async def send_submission_album_to_topic(
                 body = m.caption
                 break
 
+        moderation_message_id = await send_moderation_control_message(bot, topic_id)
+
         record = {
             "kind": "album",
             "content_type": "album",
@@ -379,7 +393,7 @@ async def send_submission_album_to_topic(
             "source_message_ids": source_ids,
             "user_id": user.id,
         }
-        return copied_ids, record
+        return moderation_message_id, record
 
     except Exception:
         with contextlib.suppress(Exception):
@@ -479,7 +493,7 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
             return
 
         try:
-            copied_ids, record = await send_submission_to_topic(
+            moderation_message_id, record = await send_submission_to_topic(
                 bot=bot,
                 topic_id=POST_CHAT_ID,
                 user=primary_message.from_user,
@@ -505,18 +519,23 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
             )
             return
 
-        first_topic_message_id = copied_ids[0]
-        pending_posts[first_topic_message_id] = record
+        pending_posts[moderation_message_id] = record
 
-        with contextlib.suppress(Exception):
-            await bot.edit_message_reply_markup(
-                chat_id=GROUP_ID,
-                message_id=first_topic_message_id,
-                reply_markup=post_action_kb(),
-            )
+        if record.get("kind") == "single":
+            with contextlib.suppress(Exception):
+                await bot.edit_message_reply_markup(
+                    chat_id=GROUP_ID,
+                    message_id=moderation_message_id,
+                    reply_markup=post_action_kb(),
+                )
 
         user_mode.pop(user_id, None)
-        await primary_message.answer("✅ Ваш пост принят на рассмотрение", reply_markup=MAIN_KB)
+        await primary_message.answer(
+            "<b>✅ Ваш пост принят на рассмотрение</b>\n\n"
+            "Хотите повторно отправить пост или обратиться в поддержку канала? "
+            "Выберите необходимую опцию при помощи кнопок ниже.",
+            reply_markup=MAIN_KB,
+        )
         return
 
     if mode == "support":
@@ -649,7 +668,7 @@ async def handle_user_content(message: Message, bot: Bot) -> None:
             return
 
         try:
-            copied_ids, record = await send_submission_to_topic(
+            moderation_message_id, record = await send_submission_to_topic(
                 bot=bot,
                 topic_id=POST_CHAT_ID,
                 user=message.from_user,
@@ -675,18 +694,22 @@ async def handle_user_content(message: Message, bot: Bot) -> None:
             )
             return
 
-        first_topic_message_id = copied_ids[0]
-        pending_posts[first_topic_message_id] = record
+        pending_posts[moderation_message_id] = record
 
         with contextlib.suppress(Exception):
             await bot.edit_message_reply_markup(
                 chat_id=GROUP_ID,
-                message_id=first_topic_message_id,
+                message_id=moderation_message_id,
                 reply_markup=post_action_kb(),
             )
 
         user_mode.pop(user_id, None)
-        await message.answer("✅ Ваш пост принят на рассмотрение", reply_markup=MAIN_KB)
+        await message.answer(
+            "<b>✅ Ваш пост принят на рассмотрение</b>\n\n"
+            "Хотите повторно отправить пост или обратиться в поддержку канала? "
+            "Выберите необходимую опцию при помощи кнопок ниже.",
+            reply_markup=MAIN_KB,
+        )
         return
 
     if mode == "support":
