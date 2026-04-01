@@ -82,7 +82,7 @@ BAN_LABEL_BY_SECONDS = {seconds: label for label, seconds in BAN_OPTIONS}
 # In-memory state
 user_mode: Dict[int, str] = {}                 # user_id -> "post" | "support"
 user_bans: Dict[int, int] = {}                 # user_id -> unix timestamp
-pending_posts: Dict[int, Dict[str, Any]] = {}  # moderation message_id -> record
+pending_posts: Dict[int, Dict[str, Any]] = {}  # first media/text message_id in topic -> record
 media_group_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}  # (chat_id, media_group_id) -> buffer
 
 
@@ -288,7 +288,6 @@ async def send_submission_single_to_topic(
                 link_preview_options=NO_PREVIEW,
             )
             sent_id = extract_message_id(sent)
-
             return sent_id, {
                 "kind": "single",
                 "content_type": "text",
@@ -332,17 +331,6 @@ async def send_submission_single_to_topic(
         raise
 
 
-async def send_moderation_control_message(bot: Bot, topic_id: int) -> int:
-    control = await bot.send_message(
-        chat_id=GROUP_ID,
-        message_thread_id=topic_id,
-        text="🛠 Используйте кнопки ниже для модерации поста.",
-        reply_markup=post_action_kb(),
-        link_preview_options=NO_PREVIEW,
-    )
-    return extract_message_id(control)
-
-
 async def send_submission_album_to_topic(
     bot: Bot,
     topic_id: int,
@@ -382,7 +370,7 @@ async def send_submission_album_to_topic(
                 body = m.caption
                 break
 
-        moderation_message_id = await send_moderation_control_message(bot, topic_id)
+        first_copied_id = copied_ids[0]
 
         record = {
             "kind": "album",
@@ -393,7 +381,7 @@ async def send_submission_album_to_topic(
             "source_message_ids": source_ids,
             "user_id": user.id,
         }
-        return moderation_message_id, record
+        return first_copied_id, record
 
     except Exception:
         with contextlib.suppress(Exception):
@@ -493,7 +481,7 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
             return
 
         try:
-            moderation_message_id, record = await send_submission_to_topic(
+            first_topic_message_id, record = await send_submission_to_topic(
                 bot=bot,
                 topic_id=POST_CHAT_ID,
                 user=primary_message.from_user,
@@ -519,15 +507,14 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
             )
             return
 
-        pending_posts[moderation_message_id] = record
+        pending_posts[first_topic_message_id] = record
 
-        if record.get("kind") == "single":
-            with contextlib.suppress(Exception):
-                await bot.edit_message_reply_markup(
-                    chat_id=GROUP_ID,
-                    message_id=moderation_message_id,
-                    reply_markup=post_action_kb(),
-                )
+        with contextlib.suppress(Exception):
+            await bot.edit_message_reply_markup(
+                chat_id=GROUP_ID,
+                message_id=first_topic_message_id,
+                reply_markup=post_action_kb(),
+            )
 
         user_mode.pop(user_id, None)
         await primary_message.answer(
@@ -668,7 +655,7 @@ async def handle_user_content(message: Message, bot: Bot) -> None:
             return
 
         try:
-            moderation_message_id, record = await send_submission_to_topic(
+            first_topic_message_id, record = await send_submission_to_topic(
                 bot=bot,
                 topic_id=POST_CHAT_ID,
                 user=message.from_user,
@@ -694,12 +681,12 @@ async def handle_user_content(message: Message, bot: Bot) -> None:
             )
             return
 
-        pending_posts[moderation_message_id] = record
+        pending_posts[first_topic_message_id] = record
 
         with contextlib.suppress(Exception):
             await bot.edit_message_reply_markup(
                 chat_id=GROUP_ID,
-                message_id=moderation_message_id,
+                message_id=first_topic_message_id,
                 reply_markup=post_action_kb(),
             )
 
