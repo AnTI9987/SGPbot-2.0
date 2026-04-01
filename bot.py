@@ -84,7 +84,7 @@ user_mode: Dict[int, str] = {}                  # user_id -> "post" | "support"
 user_bans: Dict[int, int] = {}                  # user_id -> unix timestamp
 support_banned_users: set[int] = set()          # users blocked from support
 pending_posts: Dict[int, Dict[str, Any]] = {}   # moderation/control message_id -> record
-support_message_to_user: Dict[int, int] = {}    # support topic copied message_id -> user_id
+support_message_to_user: Dict[int, int] = {}    # support topic forwarded message_id -> user_id
 media_group_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}  # (chat_id, media_group_id) -> buffer
 
 
@@ -148,9 +148,9 @@ def get_message_kind(message: Message) -> str:
     return "other"
 
 
-def build_status_text(body: str, status_line: str) -> str:
+def build_status_text(body: str, status_line: str, include_body: bool = True) -> str:
     body = (body or "").strip()
-    if body:
+    if include_body and body:
         return f"{html.escape(body)}\n\n{status_line}"
     return status_line
 
@@ -226,14 +226,6 @@ def build_media_group_for_channel(media_items: List[Dict[str, str]], body: str):
                 )
             )
     return result
-
-
-async def is_group_admin(bot: Bot, user_id: int) -> bool:
-    try:
-        member = await bot.get_chat_member(GROUP_ID, user_id)
-        return member.status in {"administrator", "creator"}
-    except Exception:
-        return False
 
 
 async def send_main_menu(message: Message) -> None:
@@ -432,24 +424,26 @@ async def send_support_submission_to_topic(
     )
 
     try:
+        copied_ids: List[int] = []
+
         if bundle_messages and len(bundle_messages) > 1:
             bundle_messages = sorted(bundle_messages, key=lambda m: m.message_id)
-            source_ids = [m.message_id for m in bundle_messages]
-            copied = await bot.copy_messages(
-                chat_id=GROUP_ID,
-                from_chat_id=bundle_messages[0].chat.id,
-                message_ids=source_ids,
-                message_thread_id=topic_id,
-            )
-            copied_ids = [extract_message_id(x) for x in copied]
+            for msg in bundle_messages:
+                forwarded = await bot.forward_message(
+                    chat_id=GROUP_ID,
+                    from_chat_id=msg.chat.id,
+                    message_id=msg.message_id,
+                    message_thread_id=topic_id,
+                )
+                copied_ids.append(extract_message_id(forwarded))
         else:
-            copied = await bot.copy_message(
+            forwarded = await bot.forward_message(
                 chat_id=GROUP_ID,
                 from_chat_id=source_message.chat.id,
                 message_id=source_message.message_id,
                 message_thread_id=topic_id,
             )
-            copied_ids = [extract_message_id(copied)]
+            copied_ids.append(extract_message_id(forwarded))
 
         return copied_ids
 
@@ -459,8 +453,14 @@ async def send_support_submission_to_topic(
         raise
 
 
-async def edit_topic_message_with_status(bot: Bot, msg: Message, status_line: str, body: str) -> None:
-    new_text = build_status_text(body, status_line)
+async def edit_topic_message_with_status(
+    bot: Bot,
+    msg: Message,
+    status_line: str,
+    body: str,
+    include_body: bool = True,
+) -> None:
+    new_text = build_status_text(body, status_line, include_body=include_body)
     if msg.text is not None:
         await bot.edit_message_text(
             chat_id=msg.chat.id,
@@ -613,7 +613,7 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
             return
         except Exception:
             logger.exception("Unexpected error while sending support message")
-            await primary_message.answer("❌ Произошла ошибка при отправке сообщения.", reply_markup=MAIN_KB)
+            await primary_message.answer("❌ Произошла ошибка при отправке сообщения.", reply_markup=CANCEL_KB)
             return
 
         for copied_id in copied_ids:
@@ -832,7 +832,7 @@ async def handle_private_fallback(message: Message, bot: Bot) -> None:
                 return
             except Exception:
                 logger.exception("Unexpected error while sending support message")
-                await message.answer("❌ Произошла ошибка при отправке сообщения.", reply_markup=MAIN_KB)
+                await message.answer("❌ Произошла ошибка при отправке сообщения.", reply_markup=CANCEL_KB)
                 return
 
             for copied_id in copied_ids:
@@ -848,10 +848,6 @@ async def handle_private_fallback(message: Message, bot: Bot) -> None:
 
 @router.callback_query(F.data == "post:accept")
 async def cb_post_accept(callback: CallbackQuery, bot: Bot) -> None:
-    if not await is_group_admin(bot, callback.from_user.id):
-        await callback.answer("Недостаточно прав", show_alert=True)
-        return
-
     msg = callback.message
     if not msg:
         await callback.answer()
@@ -865,9 +861,10 @@ async def cb_post_accept(callback: CallbackQuery, bot: Bot) -> None:
     body = record["body"]
     admin_link = admin_mention_html(callback.from_user)
     status_line = f"✅ Принято: {admin_link}"
+    include_body = record.get("kind") != "album"
 
     with contextlib.suppress(Exception):
-        await edit_topic_message_with_status(bot, msg, status_line, body)
+        await edit_topic_message_with_status(bot, msg, status_line, body, include_body=include_body)
 
     with contextlib.suppress(Exception):
         await publish_post_to_channel(bot, record)
@@ -877,10 +874,6 @@ async def cb_post_accept(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "post:reject")
 async def cb_post_reject(callback: CallbackQuery, bot: Bot) -> None:
-    if not await is_group_admin(bot, callback.from_user.id):
-        await callback.answer("Недостаточно прав", show_alert=True)
-        return
-
     msg = callback.message
     if not msg:
         await callback.answer()
@@ -894,19 +887,16 @@ async def cb_post_reject(callback: CallbackQuery, bot: Bot) -> None:
     body = record["body"]
     admin_link = admin_mention_html(callback.from_user)
     status_line = f"❌ Отклонено: {admin_link}"
+    include_body = record.get("kind") != "album"
 
     with contextlib.suppress(Exception):
-        await edit_topic_message_with_status(bot, msg, status_line, body)
+        await edit_topic_message_with_status(bot, msg, status_line, body, include_body=include_body)
 
     await callback.answer("Отклонено")
 
 
 @router.callback_query(F.data == "post:ban_menu")
 async def cb_post_ban_menu(callback: CallbackQuery, bot: Bot) -> None:
-    if not await is_group_admin(bot, callback.from_user.id):
-        await callback.answer("Недостаточно прав", show_alert=True)
-        return
-
     msg = callback.message
     if not msg:
         await callback.answer()
@@ -928,10 +918,6 @@ async def cb_post_ban_menu(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "post:back")
 async def cb_post_back(callback: CallbackQuery, bot: Bot) -> None:
-    if not await is_group_admin(bot, callback.from_user.id):
-        await callback.answer("Недостаточно прав", show_alert=True)
-        return
-
     msg = callback.message
     if not msg:
         await callback.answer()
@@ -953,10 +939,6 @@ async def cb_post_back(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data.startswith("ban:"))
 async def cb_post_ban_duration(callback: CallbackQuery, bot: Bot) -> None:
-    if not await is_group_admin(bot, callback.from_user.id):
-        await callback.answer("Недостаточно прав", show_alert=True)
-        return
-
     msg = callback.message
     if not msg:
         await callback.answer()
@@ -980,12 +962,42 @@ async def cb_post_ban_duration(callback: CallbackQuery, bot: Bot) -> None:
     label = BAN_LABEL_BY_SECONDS.get(seconds, "время")
     admin_link = admin_mention_html(callback.from_user)
     status_line = f"🚫 Бан на {label}: {admin_link}"
+    include_body = record.get("kind") != "album"
 
-    body = record["body"]
     with contextlib.suppress(Exception):
-        await edit_topic_message_with_status(bot, msg, status_line, body)
+        await edit_topic_message_with_status(bot, msg, status_line, record["body"], include_body=include_body)
 
     await callback.answer(f"Пользователь заблокирован на {label}")
+
+
+@router.message(F.chat.id == GROUP_ID, F.message_thread_id == SUP_CHAT_ID)
+async def handle_support_commands_and_replies(message: Message, bot: Bot) -> None:
+    if not message.reply_to_message:
+        return
+
+    replied_id = message.reply_to_message.message_id
+    user_id = support_message_to_user.get(replied_id)
+    if not user_id:
+        return
+
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return
+
+    if text.casefold() == "блок":
+        support_banned_users.add(user_id)
+        with contextlib.suppress(Exception):
+            await message.answer("Пользователь заблокирован в поддержке.")
+        return
+
+    escaped = html.escape(text)
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"<b>💬 Вы получили ответ от поддержки</b>\n\n<i>{escaped}</i>",
+        )
+    except Exception:
+        logger.exception("Failed to send support reply to user_id=%s", user_id)
 
 
 async def main() -> None:
