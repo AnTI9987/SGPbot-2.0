@@ -50,7 +50,7 @@ MAIN_TEXT = (
 )
 
 POST_PROMPT = "🖼️ Предложите свой пост для канала. Это может быть видео, картинка или надпись."
-SUPPORT_PROMPT = "📥 Напишите ваше сообщение в поддержку."
+SUPPORT_PROMPT = "📥 Пожалуйста, подробно опишите вашу проблему и вскоре Вы получите ответ в порядке очереди."
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🖼️ Предложить пост"), KeyboardButton(text="📥 Поддержка")]],
@@ -80,9 +80,11 @@ BAN_OPTIONS = [
 BAN_LABEL_BY_SECONDS = {seconds: label for label, seconds in BAN_OPTIONS}
 
 # In-memory state
-user_mode: Dict[int, str] = {}                 # user_id -> "post" | "support"
-user_bans: Dict[int, int] = {}                 # user_id -> unix timestamp
-pending_posts: Dict[int, Dict[str, Any]] = {}  # first media/text message_id in topic -> record
+user_mode: Dict[int, str] = {}                  # user_id -> "post" | "support"
+user_bans: Dict[int, int] = {}                  # user_id -> unix timestamp
+support_banned_users: set[int] = set()          # users blocked from support
+pending_posts: Dict[int, Dict[str, Any]] = {}   # moderation/control message_id -> record
+support_message_to_user: Dict[int, int] = {}    # support topic copied message_id -> user_id
 media_group_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}  # (chat_id, media_group_id) -> buffer
 
 
@@ -288,6 +290,7 @@ async def send_submission_single_to_topic(
                 link_preview_options=NO_PREVIEW,
             )
             sent_id = extract_message_id(sent)
+
             return sent_id, {
                 "kind": "single",
                 "content_type": "text",
@@ -331,6 +334,17 @@ async def send_submission_single_to_topic(
         raise
 
 
+async def send_moderation_control_message(bot: Bot, topic_id: int) -> int:
+    control = await bot.send_message(
+        chat_id=GROUP_ID,
+        message_thread_id=topic_id,
+        text="ㅤ",
+        reply_markup=post_action_kb(),
+        link_preview_options=NO_PREVIEW,
+    )
+    return extract_message_id(control)
+
+
 async def send_submission_album_to_topic(
     bot: Bot,
     topic_id: int,
@@ -370,7 +384,7 @@ async def send_submission_album_to_topic(
                 body = m.caption
                 break
 
-        first_copied_id = copied_ids[0]
+        control_message_id = await send_moderation_control_message(bot, topic_id)
 
         record = {
             "kind": "album",
@@ -380,8 +394,9 @@ async def send_submission_album_to_topic(
             "topic_message_ids": copied_ids,
             "source_message_ids": source_ids,
             "user_id": user.id,
+            "control_message_id": control_message_id,
         }
-        return first_copied_id, record
+        return control_message_id, record
 
     except Exception:
         with contextlib.suppress(Exception):
@@ -399,6 +414,49 @@ async def send_submission_to_topic(
     if bundle_messages and len(bundle_messages) > 1:
         return await send_submission_album_to_topic(bot, topic_id, user, bundle_messages)
     return await send_submission_single_to_topic(bot, topic_id, user, source_message)
+
+
+async def send_support_submission_to_topic(
+    bot: Bot,
+    topic_id: int,
+    user,
+    source_message: Message,
+    bundle_messages: Optional[List[Message]] = None,
+) -> List[int]:
+    author_line = f"От {user_mention_html(user)} в {now_local().strftime('%H:%M')}"
+    header_msg = await bot.send_message(
+        chat_id=GROUP_ID,
+        message_thread_id=topic_id,
+        text=author_line,
+        link_preview_options=NO_PREVIEW,
+    )
+
+    try:
+        if bundle_messages and len(bundle_messages) > 1:
+            bundle_messages = sorted(bundle_messages, key=lambda m: m.message_id)
+            source_ids = [m.message_id for m in bundle_messages]
+            copied = await bot.copy_messages(
+                chat_id=GROUP_ID,
+                from_chat_id=bundle_messages[0].chat.id,
+                message_ids=source_ids,
+                message_thread_id=topic_id,
+            )
+            copied_ids = [extract_message_id(x) for x in copied]
+        else:
+            copied = await bot.copy_message(
+                chat_id=GROUP_ID,
+                from_chat_id=source_message.chat.id,
+                message_id=source_message.message_id,
+                message_thread_id=topic_id,
+            )
+            copied_ids = [extract_message_id(copied)]
+
+        return copied_ids
+
+    except Exception:
+        with contextlib.suppress(Exception):
+            await bot.delete_message(chat_id=GROUP_ID, message_id=header_msg.message_id)
+        raise
 
 
 async def edit_topic_message_with_status(bot: Bot, msg: Message, status_line: str, body: str) -> None:
@@ -466,6 +524,9 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
     mode = user_mode.get(user_id)
 
     if mode not in {"post", "support"}:
+        if primary_message.chat.type == "private":
+            user_mode.pop(user_id, None)
+            await send_main_menu(primary_message)
         return
 
     if mode == "post":
@@ -481,7 +542,7 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
             return
 
         try:
-            first_topic_message_id, record = await send_submission_to_topic(
+            moderation_message_id, record = await send_submission_to_topic(
                 bot=bot,
                 topic_id=POST_CHAT_ID,
                 user=primary_message.from_user,
@@ -507,14 +568,15 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
             )
             return
 
-        pending_posts[first_topic_message_id] = record
+        pending_posts[moderation_message_id] = record
 
-        with contextlib.suppress(Exception):
-            await bot.edit_message_reply_markup(
-                chat_id=GROUP_ID,
-                message_id=first_topic_message_id,
-                reply_markup=post_action_kb(),
-            )
+        if record.get("kind") == "single":
+            with contextlib.suppress(Exception):
+                await bot.edit_message_reply_markup(
+                    chat_id=GROUP_ID,
+                    message_id=moderation_message_id,
+                    reply_markup=post_action_kb(),
+                )
 
         user_mode.pop(user_id, None)
         await primary_message.answer(
@@ -526,8 +588,12 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
         return
 
     if mode == "support":
+        if user_id in support_banned_users:
+            await primary_message.answer("🚫 Вы заблокированы в поддержке.")
+            return
+
         try:
-            await send_submission_to_topic(
+            copied_ids = await send_support_submission_to_topic(
                 bot=bot,
                 topic_id=SUP_CHAT_ID,
                 user=primary_message.from_user,
@@ -550,8 +616,10 @@ async def process_submission_bundle(primary_message: Message, bot: Bot, bundle_m
             await primary_message.answer("❌ Произошла ошибка при отправке сообщения.", reply_markup=MAIN_KB)
             return
 
-        user_mode.pop(user_id, None)
-        await primary_message.answer("✅ Ваше обращение отправлено в поддержку", reply_markup=MAIN_KB)
+        for copied_id in copied_ids:
+            support_message_to_user[copied_id] = user_id
+
+        await primary_message.answer("✅ Ваше обращение было передано в поддержку.")
         return
 
 
@@ -605,6 +673,36 @@ async def cancel_mode(message: Message) -> None:
     await send_main_menu(message)
 
 
+@router.message(F.chat.id == GROUP_ID, F.message_thread_id == SUP_CHAT_ID)
+async def handle_support_topic_messages(message: Message, bot: Bot) -> None:
+    if not message.reply_to_message:
+        return
+
+    replied_id = message.reply_to_message.message_id
+    user_id = support_message_to_user.get(replied_id)
+    if not user_id:
+        return
+
+    response_text = (message.text or message.caption or "").strip()
+    if not response_text:
+        return
+
+    if response_text.casefold() == "блок":
+        support_banned_users.add(user_id)
+        with contextlib.suppress(Exception):
+            await message.answer("Пользователь заблокирован в поддержке.")
+        return
+
+    escaped = html.escape(response_text)
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"<b>💬 Вы получили ответ от поддержки</b>\n\n<i>{escaped}</i>",
+        )
+    except Exception:
+        logger.exception("Failed to send support reply to user_id=%s", user_id)
+
+
 @router.message(F.media_group_id)
 async def handle_media_group_item(message: Message, bot: Bot) -> None:
     if get_message_kind(message) not in {"photo", "video"}:
@@ -624,117 +722,128 @@ async def handle_media_group_item(message: Message, bot: Bot) -> None:
 
 
 @router.message()
-async def handle_user_content(message: Message, bot: Bot) -> None:
+async def handle_private_fallback(message: Message, bot: Bot) -> None:
+    if message.chat.type != "private":
+        return
+
     if message.media_group_id:
         return
 
     user_id = message.from_user.id
     mode = user_mode.get(user_id)
 
-    if mode not in {"post", "support"}:
-        return
+    if mode in {"post", "support"}:
+        if mode == "post":
+            banned_until = user_bans.get(user_id)
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            if banned_until and banned_until > now_ts:
+                remaining = banned_until - now_ts
+                user_mode.pop(user_id, None)
+                await message.answer(
+                    f"🚫 Вы были заблокированы в предложке. Вы будете разблокированы через {format_remaining(remaining)}",
+                    reply_markup=MAIN_KB,
+                )
+                return
 
-    if mode == "post":
-        banned_until = user_bans.get(user_id)
-        now_ts = int(datetime.now(timezone.utc).timestamp())
-        if banned_until and banned_until > now_ts:
-            remaining = banned_until - now_ts
+            kind = get_message_kind(message)
+            if kind not in {"text", "photo", "video"}:
+                await message.answer(
+                    "Отправьте текст, фото или видео.",
+                    reply_markup=CANCEL_KB,
+                )
+                return
+
+            try:
+                moderation_message_id, record = await send_submission_to_topic(
+                    bot=bot,
+                    topic_id=POST_CHAT_ID,
+                    user=message.from_user,
+                    source_message=message,
+                    bundle_messages=None,
+                )
+            except TelegramBadRequest:
+                logger.exception(
+                    "Failed to send post to group/topic. Check GROUP_ID=%s, POST_CHAT_ID=%s, bot membership and topic access.",
+                    GROUP_ID,
+                    POST_CHAT_ID,
+                )
+                await message.answer(
+                    "❌ Не удалось отправить пост в тему.\n"
+                    "Проверь, что бот добавлен в форум-группу, что GROUP_ID верный и что POST_CHAT_ID указывает именно на тему для постов."
+                )
+                return
+            except Exception:
+                logger.exception("Unexpected error while sending post to topic")
+                await message.answer(
+                    "❌ Произошла ошибка при отправке поста.",
+                    reply_markup=MAIN_KB,
+                )
+                return
+
+            pending_posts[moderation_message_id] = record
+
+            with contextlib.suppress(Exception):
+                await bot.edit_message_reply_markup(
+                    chat_id=GROUP_ID,
+                    message_id=moderation_message_id,
+                    reply_markup=post_action_kb(),
+                )
+
             user_mode.pop(user_id, None)
             await message.answer(
-                f"🚫 Вы были заблокированы в предложке. Вы будете разблокированы через {format_remaining(remaining)}",
+                "<b>✅ Ваш пост принят на рассмотрение</b>\n\n"
+                "Хотите повторно отправить пост или обратиться в поддержку канала? "
+                "Выберите необходимую опцию при помощи кнопок ниже.",
                 reply_markup=MAIN_KB,
             )
             return
 
-        kind = get_message_kind(message)
-        if kind not in {"text", "photo", "video"}:
-            await message.answer(
-                "Отправьте текст, фото или видео.",
-                reply_markup=CANCEL_KB,
-            )
+        if mode == "support":
+            if user_id in support_banned_users:
+                await message.answer("🚫 Вы заблокированы в поддержке.")
+                return
+
+            kind = get_message_kind(message)
+            if kind not in {"text", "photo", "video"}:
+                await message.answer(
+                    "Отправьте текст, фото или видео.",
+                    reply_markup=CANCEL_KB,
+                )
+                return
+
+            try:
+                copied_ids = await send_support_submission_to_topic(
+                    bot=bot,
+                    topic_id=SUP_CHAT_ID,
+                    user=message.from_user,
+                    source_message=message,
+                    bundle_messages=None,
+                )
+            except TelegramBadRequest:
+                logger.exception(
+                    "Failed to send support message to group/topic. Check GROUP_ID=%s, SUP_CHAT_ID=%s, bot membership and topic access.",
+                    GROUP_ID,
+                    SUP_CHAT_ID,
+                )
+                await message.answer(
+                    "❌ Не удалось отправить сообщение в поддержку.\n"
+                    "Проверь, что бот добавлен в форум-группу, что GROUP_ID верный и что SUP_CHAT_ID указывает именно на тему поддержки."
+                )
+                return
+            except Exception:
+                logger.exception("Unexpected error while sending support message")
+                await message.answer("❌ Произошла ошибка при отправке сообщения.", reply_markup=MAIN_KB)
+                return
+
+            for copied_id in copied_ids:
+                support_message_to_user[copied_id] = user_id
+
+            await message.answer("✅ Ваше обращение было передано в поддержку.")
             return
 
-        try:
-            first_topic_message_id, record = await send_submission_to_topic(
-                bot=bot,
-                topic_id=POST_CHAT_ID,
-                user=message.from_user,
-                source_message=message,
-                bundle_messages=None,
-            )
-        except TelegramBadRequest:
-            logger.exception(
-                "Failed to send post to group/topic. Check GROUP_ID=%s, POST_CHAT_ID=%s, bot membership and topic access.",
-                GROUP_ID,
-                POST_CHAT_ID,
-            )
-            await message.answer(
-                "❌ Не удалось отправить пост в тему.\n"
-                "Проверь, что бот добавлен в форум-группу, что GROUP_ID верный и что POST_CHAT_ID указывает именно на тему для постов."
-            )
-            return
-        except Exception:
-            logger.exception("Unexpected error while sending post to topic")
-            await message.answer(
-                "❌ Произошла ошибка при отправке поста.",
-                reply_markup=MAIN_KB,
-            )
-            return
-
-        pending_posts[first_topic_message_id] = record
-
-        with contextlib.suppress(Exception):
-            await bot.edit_message_reply_markup(
-                chat_id=GROUP_ID,
-                message_id=first_topic_message_id,
-                reply_markup=post_action_kb(),
-            )
-
-        user_mode.pop(user_id, None)
-        await message.answer(
-            "<b>✅ Ваш пост принят на рассмотрение</b>\n\n"
-            "Хотите повторно отправить пост или обратиться в поддержку канала? "
-            "Выберите необходимую опцию при помощи кнопок ниже.",
-            reply_markup=MAIN_KB,
-        )
-        return
-
-    if mode == "support":
-        kind = get_message_kind(message)
-        if kind not in {"text", "photo", "video"}:
-            await message.answer(
-                "Отправьте текст, фото или видео.",
-                reply_markup=CANCEL_KB,
-            )
-            return
-
-        try:
-            await send_submission_to_topic(
-                bot=bot,
-                topic_id=SUP_CHAT_ID,
-                user=message.from_user,
-                source_message=message,
-                bundle_messages=None,
-            )
-        except TelegramBadRequest:
-            logger.exception(
-                "Failed to send support message to group/topic. Check GROUP_ID=%s, SUP_CHAT_ID=%s, bot membership and topic access.",
-                GROUP_ID,
-                SUP_CHAT_ID,
-            )
-            await message.answer(
-                "❌ Не удалось отправить сообщение в поддержку.\n"
-                "Проверь, что бот добавлен в форум-группу, что GROUP_ID верный и что SUP_CHAT_ID указывает именно на тему поддержки."
-            )
-            return
-        except Exception:
-            logger.exception("Unexpected error while sending support message")
-            await message.answer("❌ Произошла ошибка при отправке сообщения.", reply_markup=MAIN_KB)
-            return
-
-        user_mode.pop(user_id, None)
-        await message.answer("✅ Ваше обращение отправлено в поддержку", reply_markup=MAIN_KB)
-        return
+    # Not in any mode: behave like /start
+    user_mode.pop(user_id, None)
+    await send_main_menu(message)
 
 
 @router.callback_query(F.data == "post:accept")
