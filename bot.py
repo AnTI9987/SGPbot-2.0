@@ -33,20 +33,28 @@ GROUP_ID = int(os.getenv("GROUP_ID", "0"))          # форум-группа
 POST_CHAT_ID = int(os.getenv("POST_CHAT_ID", "0"))  # тема для постов
 SUP_CHAT_ID = int(os.getenv("SUP_CHAT_ID", "0"))    # тема для поддержки
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))      # канал
+PRIKOL_CHAT_ID = int(os.getenv("PRIKOL_CHAT_ID", "0"))  # чат для сообщений без режима
 PORT = int(os.getenv("PORT", "10000"))
 
-if not BOT_TOKEN or not GROUP_ID or not POST_CHAT_ID or not SUP_CHAT_ID or not CHANNEL_ID:
+if (
+    not BOT_TOKEN
+    or not GROUP_ID
+    or not POST_CHAT_ID
+    or not SUP_CHAT_ID
+    or not CHANNEL_ID
+    or not PRIKOL_CHAT_ID
+):
     raise RuntimeError(
-        "Missing one of required env vars: BOT_TOKEN, GROUP_ID, POST_CHAT_ID, SUP_CHAT_ID, CHANNEL_ID"
+        "Missing one of required env vars: "
+        "BOT_TOKEN, GROUP_ID, POST_CHAT_ID, SUP_CHAT_ID, CHANNEL_ID, PRIKOL_CHAT_ID"
     )
 
 router = Router()
+
 TZ = ZoneInfo("Europe/Zaporozhye")
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
-# Время ожидания после ПОСЛЕДНЕГО сообщения альбома.
-# Это позволяет дождаться всех фотографий, даже если Telegram доставляет их
-# с небольшой задержкой.
+# Сколько ждать после ПОСЛЕДНЕГО сообщения альбома.
 ALBUM_COLLECT_DELAY = 2.0
 
 MAIN_TEXT = (
@@ -54,16 +62,30 @@ MAIN_TEXT = (
     "Здесь Вы можете предложить пост или обратиться в поддержку канала."
 )
 
-POST_PROMPT = "🖼️ Предложите свой пост для канала. Это может быть видео, картинка или надпись."
-SUPPORT_PROMPT = "📥 Пожалуйста, подробно опишите вашу проблему и вскоре Вы получите ответ в порядке очереди."
+POST_PROMPT = (
+    "🖼️ Предложите свой пост для канала. "
+    "Это может быть видео, картинка или надпись."
+)
+
+SUPPORT_PROMPT = (
+    "📥 Пожалуйста, подробно опишите вашу проблему "
+    "и вскоре Вы получите ответ в порядке очереди."
+)
 
 MAIN_KB = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="🖼️ Предложить пост"), KeyboardButton(text="📥 Поддержка")]],
+    keyboard=[
+        [
+            KeyboardButton(text="🖼️ Предложить пост"),
+            KeyboardButton(text="📥 Поддержка"),
+        ]
+    ],
     resize_keyboard=True,
 )
 
 CANCEL_KB = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text="❌ Отменить")]],
+    keyboard=[
+        [KeyboardButton(text="❌ Отменить")]
+    ],
     resize_keyboard=True,
 )
 
@@ -82,16 +104,37 @@ BAN_OPTIONS = [
     ("1 мес", 30 * 24 * 60 * 60),
     ("3 мес", 90 * 24 * 60 * 60),
 ]
-BAN_LABEL_BY_SECONDS = {seconds: label for label, seconds in BAN_OPTIONS}
 
-# In-memory state
-user_mode: Dict[int, str] = {}                  # user_id -> "post" | "support"
-user_bans: Dict[int, int] = {}                  # user_id -> unix timestamp
-support_banned_users: set[int] = set()          # users blocked from support
-pending_posts: Dict[int, Dict[str, Any]] = {}   # moderation/control message_id -> record
-support_message_to_user: Dict[int, int] = {}    # support topic forwarded message_id -> user_id
-media_group_buffers: Dict[Tuple[int, str], Dict[str, Any]] = {}  # (chat_id, media_group_id) -> buffer
+BAN_LABEL_BY_SECONDS = {
+    seconds: label
+    for label, seconds in BAN_OPTIONS
+}
 
+
+# ============================================================
+# IN-MEMORY STATE
+# ============================================================
+
+user_mode: Dict[int, str] = {}
+user_bans: Dict[int, int] = {}
+support_banned_users: set[int] = set()
+
+# moderation/control message_id -> record
+pending_posts: Dict[int, Dict[str, Any]] = {}
+
+# support topic forwarded message_id -> user_id
+support_message_to_user: Dict[int, int] = {}
+
+# (chat_id, media_group_id) -> buffer
+media_group_buffers: Dict[
+    Tuple[int, str],
+    Dict[str, Any]
+] = {}
+
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def now_local() -> datetime:
     return datetime.now(TZ)
@@ -101,20 +144,45 @@ def extract_message_id(result: Any) -> int:
     return int(getattr(result, "message_id", result))
 
 
-def mention_html(user_id: int, full_name: str, username: Optional[str] = None) -> str:
-    safe_name = html.escape(full_name or "Пользователь")
+def mention_html(
+    user_id: int,
+    full_name: str,
+    username: Optional[str] = None
+) -> str:
+    safe_name = html.escape(
+        full_name or "Пользователь"
+    )
+
     if username:
-        safe_username = html.escape(username, quote=True)
-        return f'<a href="https://t.me/{safe_username}">{safe_name}</a>'
-    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
+        safe_username = html.escape(
+            username,
+            quote=True
+        )
+        return (
+            f'<a href="https://t.me/{safe_username}">'
+            f'{safe_name}</a>'
+        )
+
+    return (
+        f'<a href="tg://user?id={user_id}">'
+        f'{safe_name}</a>'
+    )
 
 
 def user_mention_html(user) -> str:
-    return mention_html(user.id, user.full_name, user.username)
+    return mention_html(
+        user.id,
+        user.full_name,
+        user.username
+    )
 
 
 def admin_mention_html(user) -> str:
-    return mention_html(user.id, user.full_name, user.username)
+    return mention_html(
+        user.id,
+        user.full_name,
+        user.username
+    )
 
 
 def format_remaining(seconds_left: int) -> str:
@@ -122,72 +190,131 @@ def format_remaining(seconds_left: int) -> str:
         return "0м"
 
     total_minutes = (seconds_left + 59) // 60
-    days, rem_minutes = divmod(total_minutes, 24 * 60)
-    hours, minutes = divmod(rem_minutes, 60)
+    days, rem_minutes = divmod(
+        total_minutes,
+        24 * 60
+    )
+    hours, minutes = divmod(
+        rem_minutes,
+        60
+    )
 
     parts = []
+
     if days:
         parts.append(f"{days}д")
+
     if hours:
         parts.append(f"{hours}ч")
+
     if minutes or not parts:
         parts.append(f"{minutes}м")
+
     return " ".join(parts)
 
 
 def get_post_body(message: Message) -> str:
     if message.text:
         return message.text
+
     if message.caption:
         return message.caption
+
     return ""
 
 
 def get_message_kind(message: Message) -> str:
     if message.text:
         return "text"
+
     if message.photo:
         return "photo"
+
     if message.video:
         return "video"
+
     return "other"
 
 
-def build_status_text(body: str, status_line: str, include_body: bool = True) -> str:
+def build_status_text(
+    body: str,
+    status_line: str,
+    include_body: bool = True
+) -> str:
     body = (body or "").strip()
+
     if include_body and body:
-        return f"{html.escape(body)}\n\n{status_line}"
+        return (
+            f"{html.escape(body)}\n\n"
+            f"{status_line}"
+        )
+
     return status_line
 
 
 def build_channel_text(body: str) -> str:
     body = (body or "").strip()
+
     parts = []
+
     if body:
-        parts.append(html.escape(body))
-    parts.append(CHANNEL_FOOTER)
+        parts.append(
+            html.escape(body)
+        )
+
+    parts.append(
+        CHANNEL_FOOTER
+    )
+
     text = "\n\n".join(parts)
-    return text[:4096] if len(text) <= 4096 else text[:4093] + "..."
+
+    if len(text) <= 4096:
+        return text
+
+    return text[:4093] + "..."
 
 
 def build_channel_caption(body: str) -> str:
     body = (body or "").strip()
+
     parts = []
+
     if body:
-        parts.append(html.escape(body))
-    parts.append(CHANNEL_FOOTER)
+        parts.append(
+            html.escape(body)
+        )
+
+    parts.append(
+        CHANNEL_FOOTER
+    )
+
     caption = "\n\n".join(parts)
-    return caption[:1024] if len(caption) <= 1024 else caption[:1021] + "..."
+
+    if len(caption) <= 1024:
+        return caption
+
+    return caption[:1021] + "..."
 
 
 def post_action_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Принять", callback_data="post:accept"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data="post:reject"),
+                InlineKeyboardButton(
+                    text="✅ Принять",
+                    callback_data="post:accept"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data="post:reject"
+                ),
             ],
-            [InlineKeyboardButton(text="🚫 Заблокировать", callback_data="post:ban_menu")],
+            [
+                InlineKeyboardButton(
+                    text="🚫 Заблокировать",
+                    callback_data="post:ban_menu"
+                )
+            ],
         ]
     )
 
@@ -212,11 +339,22 @@ def ban_menu_kb() -> InlineKeyboardMarkup:
         rows.append(row)
 
     rows.append(
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="post:back")]
+        [
+            InlineKeyboardButton(
+                text="◀️ Назад",
+                callback_data="post:back"
+            )
+        ]
     )
 
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
 
+
+# ============================================================
+# MEDIA GROUP BUILDERS
+# ============================================================
 
 def build_media_group_for_channel(
     media_items: List[Dict[str, str]],
@@ -225,57 +363,84 @@ def build_media_group_for_channel(
     caption = build_channel_caption(body)
     result = []
 
-    for i, item in enumerate(media_items):
-        mtype = item["type"]
+    for index, item in enumerate(media_items):
+        media_type = item["type"]
         file_id = item["file_id"]
 
-        if mtype == "photo":
+        if media_type == "photo":
             result.append(
                 InputMediaPhoto(
                     media=file_id,
-                    caption=caption if i == 0 else None,
-                    parse_mode=ParseMode.HTML,
+                    caption=(
+                        caption
+                        if index == 0
+                        else None
+                    ),
+                    parse_mode=(
+                        ParseMode.HTML
+                        if index == 0
+                        else None
+                    ),
                 )
             )
 
-        elif mtype == "video":
+        elif media_type == "video":
             result.append(
                 InputMediaVideo(
                     media=file_id,
-                    caption=caption if i == 0 else None,
-                    parse_mode=ParseMode.HTML,
+                    caption=(
+                        caption
+                        if index == 0
+                        else None
+                    ),
+                    parse_mode=(
+                        ParseMode.HTML
+                        if index == 0
+                        else None
+                    ),
                 )
             )
 
     return result
 
 
-# НОВАЯ ФУНКЦИЯ:
-# Формирует альбом для отправки непосредственно в тему форума.
 def build_media_group_for_topic(
     bundle_messages: List[Message]
 ):
     result = []
-
     body = ""
 
-    # Ищем caption у первого сообщения альбома, у которого он есть.
+    # Caption может находиться только у одного элемента альбома.
     for message in bundle_messages:
         if message.caption:
             body = message.caption
             break
 
-    escaped_caption = html.escape(body) if body else ""
+    escaped_caption = (
+        html.escape(body)
+        if body
+        else None
+    )
 
     for index, message in enumerate(bundle_messages):
-        caption = escaped_caption if index == 0 and escaped_caption else None
+        caption = (
+            escaped_caption
+            if index == 0
+            else None
+        )
+
+        parse_mode = (
+            ParseMode.HTML
+            if caption
+            else None
+        )
 
         if message.photo:
             result.append(
                 InputMediaPhoto(
                     media=message.photo[-1].file_id,
                     caption=caption,
-                    parse_mode=ParseMode.HTML if caption else None,
+                    parse_mode=parse_mode,
                 )
             )
 
@@ -284,44 +449,122 @@ def build_media_group_for_topic(
                 InputMediaVideo(
                     media=message.video.file_id,
                     caption=caption,
-                    parse_mode=ParseMode.HTML if caption else None,
+                    parse_mode=parse_mode,
                 )
             )
 
     return result, body
 
 
-async def send_main_menu(message: Message) -> None:
+def build_media_group_for_prikol(
+    bundle_messages: List[Message]
+):
+    result = []
+
+    body = ""
+
+    for message in bundle_messages:
+        if message.caption:
+            body = message.caption
+            break
+
+    escaped_caption = (
+        html.escape(body)
+        if body
+        else None
+    )
+
+    for index, message in enumerate(bundle_messages):
+        caption = (
+            escaped_caption
+            if index == 0
+            else None
+        )
+
+        parse_mode = (
+            ParseMode.HTML
+            if caption
+            else None
+        )
+
+        if message.photo:
+            result.append(
+                InputMediaPhoto(
+                    media=message.photo[-1].file_id,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                )
+            )
+
+        elif message.video:
+            result.append(
+                InputMediaVideo(
+                    media=message.video.file_id,
+                    caption=caption,
+                    parse_mode=parse_mode,
+                )
+            )
+
+    return result
+
+
+# ============================================================
+# BASIC UI
+# ============================================================
+
+async def send_main_menu(
+    message: Message
+) -> None:
     await message.answer(
         MAIN_TEXT,
         reply_markup=MAIN_KB
     )
 
 
-async def send_post_prompt(message: Message) -> None:
+async def send_post_prompt(
+    message: Message
+) -> None:
     await message.answer(
         POST_PROMPT,
         reply_markup=CANCEL_KB
     )
 
 
-async def send_support_prompt(message: Message) -> None:
+async def send_support_prompt(
+    message: Message
+) -> None:
     await message.answer(
         SUPPORT_PROMPT,
         reply_markup=CANCEL_KB
     )
 
 
+# ============================================================
+# WEB SERVER
+# ============================================================
+
 async def start_web_server() -> web.AppRunner:
     app = web.Application()
 
-    async def healthcheck(request: web.Request) -> web.Response:
-        return web.Response(text="OK")
+    async def healthcheck(
+        request: web.Request
+    ) -> web.Response:
+        return web.Response(
+            text="OK"
+        )
 
-    app.router.add_get("/", healthcheck)
-    app.router.add_get("/health", healthcheck)
+    app.router.add_get(
+        "/",
+        healthcheck
+    )
+
+    app.router.add_get(
+        "/health",
+        healthcheck
+    )
 
     runner = web.AppRunner(app)
+
     await runner.setup()
 
     site = web.TCPSite(
@@ -339,6 +582,10 @@ async def start_web_server() -> web.AppRunner:
 
     return runner
 
+
+# ============================================================
+# POST -> TOPIC
+# ============================================================
 
 async def send_submission_single_to_topic(
     bot: Bot,
@@ -359,24 +606,36 @@ async def send_submission_single_to_topic(
     )
 
     try:
-        kind = get_message_kind(source_message)
+        kind = get_message_kind(
+            source_message
+        )
 
         if kind == "text":
             sent = await bot.send_message(
                 chat_id=GROUP_ID,
                 message_thread_id=topic_id,
-                text=html.escape(source_message.text or ""),
+                text=html.escape(
+                    source_message.text or ""
+                ),
                 link_preview_options=NO_PREVIEW,
             )
 
-            sent_id = extract_message_id(sent)
+            sent_id = extract_message_id(
+                sent
+            )
 
             return sent_id, {
                 "kind": "single",
                 "content_type": "text",
-                "body": get_post_body(source_message),
-                "topic_message_ids": [sent_id],
-                "source_message_ids": [source_message.message_id],
+                "body": get_post_body(
+                    source_message
+                ),
+                "topic_message_ids": [
+                    sent_id
+                ],
+                "source_message_ids": [
+                    source_message.message_id
+                ],
                 "user_id": user.id,
             }
 
@@ -388,9 +647,15 @@ async def send_submission_single_to_topic(
                 message_thread_id=topic_id,
             )
 
-            copied_id = extract_message_id(copied)
+            copied_id = extract_message_id(
+                copied
+            )
 
-            media_type = "photo" if source_message.photo else "video"
+            media_type = (
+                "photo"
+                if source_message.photo
+                else "video"
+            )
 
             file_id = (
                 source_message.photo[-1].file_id
@@ -401,14 +666,22 @@ async def send_submission_single_to_topic(
             return copied_id, {
                 "kind": "single",
                 "content_type": media_type,
-                "body": get_post_body(source_message),
+                "body": get_post_body(
+                    source_message
+                ),
                 "file_id": file_id,
-                "topic_message_ids": [copied_id],
-                "source_message_ids": [source_message.message_id],
+                "topic_message_ids": [
+                    copied_id
+                ],
+                "source_message_ids": [
+                    source_message.message_id
+                ],
                 "user_id": user.id,
             }
 
-        raise ValueError("Unsupported message type")
+        raise ValueError(
+            "Unsupported message type"
+        )
 
     except Exception:
         with contextlib.suppress(Exception):
@@ -420,35 +693,18 @@ async def send_submission_single_to_topic(
         raise
 
 
-async def send_moderation_control_message(
-    bot: Bot,
-    topic_id: int
-) -> int:
-
-    control = await bot.send_message(
-        chat_id=GROUP_ID,
-        message_thread_id=topic_id,
-        text="ㅤ",
-        reply_markup=post_action_kb(),
-        link_preview_options=NO_PREVIEW,
-    )
-
-    return extract_message_id(control)
-
-
 async def send_submission_album_to_topic(
     bot: Bot,
     topic_id: int,
     user,
     bundle_messages: List[Message],
 ):
-    # Сортируем по message_id.
     bundle_messages = sorted(
         bundle_messages,
         key=lambda m: m.message_id
     )
 
-    # Удаляем возможные дубликаты сообщений.
+    # Убираем возможные дубликаты.
     unique_messages = []
     seen_ids = set()
 
@@ -456,12 +712,15 @@ async def send_submission_album_to_topic(
         if message.message_id in seen_ids:
             continue
 
-        seen_ids.add(message.message_id)
-        unique_messages.append(message)
+        seen_ids.add(
+            message.message_id
+        )
+        unique_messages.append(
+            message
+        )
 
     bundle_messages = unique_messages
 
-    # Telegram разрешает sendMediaGroup от 2 до 10 элементов.
     if len(bundle_messages) < 2:
         return await send_submission_single_to_topic(
             bot=bot,
@@ -469,9 +728,6 @@ async def send_submission_album_to_topic(
             user=user,
             source_message=bundle_messages[0],
         )
-
-    if len(bundle_messages) > 10:
-        bundle_messages = bundle_messages[:10]
 
     author_line = (
         f"От {user_mention_html(user)} "
@@ -486,7 +742,6 @@ async def send_submission_album_to_topic(
     )
 
     try:
-        # Вместо copy_messages отправляем альбом непосредственно в тему.
         media, body = build_media_group_for_topic(
             bundle_messages
         )
@@ -497,15 +752,23 @@ async def send_submission_album_to_topic(
             )
 
         if len(media) > 10:
-            media = media[:10]
+            raise ValueError(
+                "Telegram album cannot contain more than 10 media items"
+            )
 
+        # Отправляем альбом непосредственно в нужную тему.
         sent_messages = await bot.send_media_group(
             chat_id=GROUP_ID,
             message_thread_id=topic_id,
             media=media,
         )
 
-        copied_ids = [
+        if not sent_messages:
+            raise ValueError(
+                "Telegram returned an empty media group"
+            )
+
+        topic_message_ids = [
             extract_message_id(message)
             for message in sent_messages
         ]
@@ -517,7 +780,7 @@ async def send_submission_album_to_topic(
                 media_items.append(
                     {
                         "type": "photo",
-                        "file_id": message.photo[-1].file_id
+                        "file_id": message.photo[-1].file_id,
                     }
                 )
 
@@ -525,30 +788,30 @@ async def send_submission_album_to_topic(
                 media_items.append(
                     {
                         "type": "video",
-                        "file_id": message.video.file_id
+                        "file_id": message.video.file_id,
                     }
                 )
 
-        control_message_id = await send_moderation_control_message(
-            bot,
-            topic_id
-        )
+        # ВАЖНО:
+        # теперь moderation_message_id = первое сообщение самого альбома.
+        # Отдельное "ㅤ" сообщение больше не создаётся.
+        moderation_message_id = topic_message_ids[0]
 
         record = {
             "kind": "album",
             "content_type": "album",
             "body": body,
             "media_items": media_items,
-            "topic_message_ids": copied_ids,
+            "topic_message_ids": topic_message_ids,
             "source_message_ids": [
                 message.message_id
                 for message in bundle_messages
             ],
             "user_id": user.id,
-            "control_message_id": control_message_id,
+            "control_message_id": moderation_message_id,
         }
 
-        return control_message_id, record
+        return moderation_message_id, record
 
     except Exception:
         with contextlib.suppress(Exception):
@@ -583,6 +846,10 @@ async def send_submission_to_topic(
     )
 
 
+# ============================================================
+# SUPPORT
+# ============================================================
+
 async def send_support_submission_to_topic(
     bot: Bot,
     topic_id: int,
@@ -612,16 +879,18 @@ async def send_support_submission_to_topic(
                 key=lambda m: m.message_id
             )
 
-            for msg in bundle_messages:
+            for message in bundle_messages:
                 forwarded = await bot.forward_message(
                     chat_id=GROUP_ID,
-                    from_chat_id=msg.chat.id,
-                    message_id=msg.message_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
                     message_thread_id=topic_id,
                 )
 
                 copied_ids.append(
-                    extract_message_id(forwarded)
+                    extract_message_id(
+                        forwarded
+                    )
                 )
 
         else:
@@ -633,7 +902,9 @@ async def send_support_submission_to_topic(
             )
 
             copied_ids.append(
-                extract_message_id(forwarded)
+                extract_message_id(
+                    forwarded
+                )
             )
 
         return copied_ids
@@ -647,6 +918,94 @@ async def send_support_submission_to_topic(
 
         raise
 
+
+# ============================================================
+# PRIKOL CHAT
+# ============================================================
+
+async def send_message_silently_to_prikol(
+    bot: Bot,
+    message: Message
+) -> None:
+    """
+    Молча копирует любое сообщение пользователя,
+    если у него нет активной функции.
+    """
+
+    try:
+        await bot.copy_message(
+            chat_id=PRIKOL_CHAT_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to silently copy message %s "
+            "from user %s to PRIKOL_CHAT_ID=%s",
+            message.message_id,
+            message.from_user.id,
+            PRIKOL_CHAT_ID,
+        )
+
+
+async def send_album_silently_to_prikol(
+    bot: Bot,
+    bundle_messages: List[Message]
+) -> None:
+    """
+    Молча отправляет альбом пользователя в PRIKOL_CHAT_ID.
+    """
+
+    try:
+        bundle_messages = sorted(
+            bundle_messages,
+            key=lambda m: m.message_id
+        )
+
+        unique_messages = []
+        seen_ids = set()
+
+        for message in bundle_messages:
+            if message.message_id in seen_ids:
+                continue
+
+            seen_ids.add(
+                message.message_id
+            )
+            unique_messages.append(
+                message
+            )
+
+        bundle_messages = unique_messages
+
+        media = build_media_group_for_prikol(
+            bundle_messages
+        )
+
+        if len(media) >= 2:
+            await bot.send_media_group(
+                chat_id=PRIKOL_CHAT_ID,
+                media=media,
+            )
+
+        elif len(bundle_messages) == 1:
+            await send_message_silently_to_prikol(
+                bot,
+                bundle_messages[0]
+            )
+
+    except Exception:
+        logger.exception(
+            "Failed to silently send media group "
+            "to PRIKOL_CHAT_ID=%s",
+            PRIKOL_CHAT_ID,
+        )
+
+
+# ============================================================
+# EDIT MESSAGE STATUS
+# ============================================================
 
 async def edit_topic_message_with_status(
     bot: Bot,
@@ -671,7 +1030,7 @@ async def edit_topic_message_with_status(
             link_preview_options=NO_PREVIEW,
         )
 
-    else:
+    elif msg.caption is not None:
         await bot.edit_message_caption(
             chat_id=msg.chat.id,
             message_id=msg.message_id,
@@ -679,6 +1038,20 @@ async def edit_topic_message_with_status(
             reply_markup=None,
         )
 
+    else:
+        # У первого сообщения альбома caption может отсутствовать.
+        # В таком случае добавляем caption.
+        await bot.edit_message_caption(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            caption=new_text,
+            reply_markup=None,
+        )
+
+
+# ============================================================
+# PUBLISH
+# ============================================================
 
 async def publish_post_to_channel(
     bot: Bot,
@@ -721,7 +1094,7 @@ async def publish_post_to_channel(
         if media:
             await bot.send_media_group(
                 CHANNEL_ID,
-                media=media
+                media=media,
             )
 
         return
@@ -733,6 +1106,10 @@ async def publish_post_to_channel(
     )
 
 
+# ============================================================
+# PROCESS SUBMISSION
+# ============================================================
+
 async def process_submission_bundle(
     primary_message: Message,
     bot: Bot,
@@ -742,25 +1119,35 @@ async def process_submission_bundle(
     user_id = primary_message.from_user.id
     mode = user_mode.get(user_id)
 
+    # Нет активного режима.
+    # Для обычных сообщений и альбомов здесь просто ничего не отвечаем:
+    # отдельная логика отправит их в PRIKOL_CHAT_ID.
     if mode not in {"post", "support"}:
-        if primary_message.chat.type == "private":
-            user_mode.pop(user_id, None)
-            await send_main_menu(primary_message)
-
         return
+
+    # --------------------------------------------------------
+    # POST
+    # --------------------------------------------------------
 
     if mode == "post":
         banned_until = user_bans.get(user_id)
+
         now_ts = int(
             datetime.now(timezone.utc).timestamp()
         )
 
         if banned_until and banned_until > now_ts:
-            remaining = banned_until - now_ts
-            user_mode.pop(user_id, None)
+            remaining = (
+                banned_until - now_ts
+            )
+
+            user_mode.pop(
+                user_id,
+                None
+            )
 
             await primary_message.answer(
-                f"🚫 Вы были заблокированы в предложке. "
+                "🚫 Вы были заблокированы в предложке. "
                 f"Вы будете разблокированы через "
                 f"{format_remaining(remaining)}",
                 reply_markup=MAIN_KB,
@@ -769,12 +1156,14 @@ async def process_submission_bundle(
             return
 
         try:
-            moderation_message_id, record = await send_submission_to_topic(
-                bot=bot,
-                topic_id=POST_CHAT_ID,
-                user=primary_message.from_user,
-                source_message=primary_message,
-                bundle_messages=bundle_messages,
+            moderation_message_id, record = (
+                await send_submission_to_topic(
+                    bot=bot,
+                    topic_id=POST_CHAT_ID,
+                    user=primary_message.from_user,
+                    source_message=primary_message,
+                    bundle_messages=bundle_messages,
+                )
             )
 
         except TelegramBadRequest as e:
@@ -804,17 +1193,46 @@ async def process_submission_bundle(
 
             return
 
-        pending_posts[moderation_message_id] = record
+        pending_posts[
+            moderation_message_id
+        ] = record
 
-        if record.get("kind") == "single":
-            with contextlib.suppress(Exception):
-                await bot.edit_message_reply_markup(
-                    chat_id=GROUP_ID,
-                    message_id=moderation_message_id,
-                    reply_markup=post_action_kb(),
-                )
+        # ВАЖНО:
+        # кнопки добавляются и к одиночному сообщению,
+        # и к первому сообщению альбома.
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=GROUP_ID,
+                message_id=moderation_message_id,
+                reply_markup=post_action_kb(),
+            )
 
-        user_mode.pop(user_id, None)
+        except Exception:
+            logger.exception(
+                "Failed to add moderation keyboard "
+                "to message_id=%s",
+                moderation_message_id,
+            )
+
+            # Если клавиатура не добавилась, удаляем запись,
+            # чтобы не оставить некорректный пост в памяти.
+            pending_posts.pop(
+                moderation_message_id,
+                None
+            )
+
+            await primary_message.answer(
+                "❌ Не удалось добавить кнопки управления "
+                "к предложенному посту.",
+                reply_markup=MAIN_KB,
+            )
+
+            return
+
+        user_mode.pop(
+            user_id,
+            None
+        )
 
         await primary_message.answer(
             "<b>✅ Ваш пост принят на рассмотрение</b>\n\n"
@@ -826,7 +1244,12 @@ async def process_submission_bundle(
 
         return
 
+    # --------------------------------------------------------
+    # SUPPORT
+    # --------------------------------------------------------
+
     if mode == "support":
+
         if user_id in support_banned_users:
             await primary_message.answer(
                 "🚫 Вы заблокированы в поддержке."
@@ -834,12 +1257,14 @@ async def process_submission_bundle(
             return
 
         try:
-            copied_ids = await send_support_submission_to_topic(
-                bot=bot,
-                topic_id=SUP_CHAT_ID,
-                user=primary_message.from_user,
-                source_message=primary_message,
-                bundle_messages=bundle_messages,
+            copied_ids = (
+                await send_support_submission_to_topic(
+                    bot=bot,
+                    topic_id=SUP_CHAT_ID,
+                    user=primary_message.from_user,
+                    source_message=primary_message,
+                    bundle_messages=bundle_messages,
+                )
             )
 
         except TelegramBadRequest:
@@ -873,7 +1298,9 @@ async def process_submission_bundle(
             return
 
         for copied_id in copied_ids:
-            support_message_to_user[copied_id] = user_id
+            support_message_to_user[
+                copied_id
+            ] = user_id
 
         await primary_message.answer(
             "✅ Ваше обращение было передано в поддержку."
@@ -881,22 +1308,24 @@ async def process_submission_bundle(
 
         return
 
-    # Not in any mode: behave like /start
-    user_mode.pop(user_id, None)
-    await send_main_menu(primary_message)
 
+# ============================================================
+# MEDIA GROUP PROCESSING
+# ============================================================
 
-# НОВАЯ ВЕРСИЯ:
-# Ждём ALBUM_COLLECT_DELAY секунд после ПОСЛЕДНЕГО сообщения.
 async def process_media_group_after_delay(
     key: Tuple[int, str],
     bot: Bot
 ) -> None:
 
     try:
-        await asyncio.sleep(ALBUM_COLLECT_DELAY)
+        await asyncio.sleep(
+            ALBUM_COLLECT_DELAY
+        )
 
-        buffer = media_group_buffers.get(key)
+        buffer = media_group_buffers.get(
+            key
+        )
 
         if not buffer:
             return
@@ -909,18 +1338,39 @@ async def process_media_group_after_delay(
         if not messages:
             return
 
-        # Удаляем buffer только непосредственно перед обработкой.
-        media_group_buffers.pop(key, None)
+        media_group_buffers.pop(
+            key,
+            None
+        )
+
+        primary_message = messages[0]
+
+        mode = user_mode.get(
+            primary_message.from_user.id
+        )
+
+        # ----------------------------------------------------
+        # НЕТ АКТИВНОГО РЕЖИМА
+        # ----------------------------------------------------
+
+        if mode not in {"post", "support"}:
+            await send_album_silently_to_prikol(
+                bot,
+                messages
+            )
+            return
+
+        # ----------------------------------------------------
+        # ЕСТЬ АКТИВНЫЙ РЕЖИМ
+        # ----------------------------------------------------
 
         await process_submission_bundle(
-            messages[0],
+            primary_message,
             bot,
             bundle_messages=messages
         )
 
     except asyncio.CancelledError:
-        # Нормальное поведение:
-        # новый элемент альбома отменяет старый таймер.
         raise
 
     except Exception:
@@ -929,31 +1379,41 @@ async def process_media_group_after_delay(
             key
         )
 
-    finally:
-        # Очищаем ссылку на завершившуюся task.
-        buffer = media_group_buffers.get(key)
 
-        if buffer is not None:
-            task = buffer.get("task")
-
-            if task is asyncio.current_task():
-                buffer["task"] = None
-
+# ============================================================
+# COMMAND START
+# ============================================================
 
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def cmd_start(
+    message: Message
+) -> None:
+
     user_mode.pop(
         message.from_user.id,
         None
     )
 
-    await send_main_menu(message)
+    await send_main_menu(
+        message
+    )
 
 
-@router.message(F.text == "🖼️ Предложить пост")
-async def enter_post_mode(message: Message) -> None:
+# ============================================================
+# ENTER POST MODE
+# ============================================================
+
+@router.message(
+    F.text == "🖼️ Предложить пост"
+)
+async def enter_post_mode(
+    message: Message
+) -> None:
+
     user_id = message.from_user.id
-    banned_until = user_bans.get(user_id)
+    banned_until = user_bans.get(
+        user_id
+    )
 
     if banned_until:
         now_ts = int(
@@ -961,10 +1421,12 @@ async def enter_post_mode(message: Message) -> None:
         )
 
         if banned_until > now_ts:
-            remaining = banned_until - now_ts
+            remaining = (
+                banned_until - now_ts
+            )
 
             await message.answer(
-                f"🚫 Вы были заблокированы в предложке. "
+                "🚫 Вы были заблокированы в предложке. "
                 f"Вы будете разблокированы через "
                 f"{format_remaining(remaining)}"
             )
@@ -977,569 +1439,56 @@ async def enter_post_mode(message: Message) -> None:
         )
 
     user_mode[user_id] = "post"
-    await send_post_prompt(message)
+
+    await send_post_prompt(
+        message
+    )
 
 
-@router.message(F.text == "📥 Поддержка")
-async def enter_support_mode(message: Message) -> None:
-    user_mode[message.from_user.id] = "support"
-    await send_support_prompt(message)
+# ============================================================
+# ENTER SUPPORT MODE
+# ============================================================
+
+@router.message(
+    F.text == "📥 Поддержка"
+)
+async def enter_support_mode(
+    message: Message
+) -> None:
+
+    user_mode[
+        message.from_user.id
+    ] = "support"
+
+    await send_support_prompt(
+        message
+    )
 
 
-@router.message(F.text == "❌ Отменить")
-async def cancel_mode(message: Message) -> None:
+# ============================================================
+# CANCEL
+# ============================================================
+
+@router.message(
+    F.text == "❌ Отменить"
+)
+async def cancel_mode(
+    message: Message
+) -> None:
+
     user_mode.pop(
         message.from_user.id,
         None
     )
 
-    await send_main_menu(message)
-
-
-@router.message(
-    F.chat.id == GROUP_ID,
-    F.message_thread_id == SUP_CHAT_ID
-)
-async def handle_support_topic_messages(
-    message: Message,
-    bot: Bot
-) -> None:
-
-    if not message.reply_to_message:
-        return
-
-    replied_id = message.reply_to_message.message_id
-
-    user_id = support_message_to_user.get(
-        replied_id
-    )
-
-    if not user_id:
-        return
-
-    response_text = (
-        message.text
-        or message.caption
-        or ""
-    ).strip()
-
-    if not response_text:
-        return
-
-    if response_text.casefold() == "блок":
-        support_banned_users.add(user_id)
-
-        with contextlib.suppress(Exception):
-            await message.answer(
-                "Пользователь заблокирован в поддержке."
-            )
-
-        return
-
-    escaped = html.escape(
-        response_text
-    )
-
-    try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=(
-                "<b>💬 Вы получили ответ от поддержки</b>\n\n"
-                f"<i>{escaped}</i>"
-            ),
-        )
-
-    except Exception:
-        logger.exception(
-            "Failed to send support reply to user_id=%s",
-            user_id
-        )
-
-
-# ИЗМЕНЕНО:
-# Теперь каждый новый элемент альбома сбрасывает таймер.
-@router.message(F.media_group_id)
-async def handle_media_group_item(
-    message: Message,
-    bot: Bot
-) -> None:
-
-    if get_message_kind(message) not in {
-        "photo",
-        "video"
-    }:
-        return
-
-    key = (
-        message.chat.id,
-        message.media_group_id
-    )
-
-    buffer = media_group_buffers.get(key)
-
-    if buffer is None:
-        buffer = {
-            "messages": [],
-            "task": None,
-        }
-
-        media_group_buffers[key] = buffer
-
-    # Не добавляем один и тот же message_id дважды.
-    existing_ids = {
-        msg.message_id
-        for msg in buffer["messages"]
-    }
-
-    if message.message_id not in existing_ids:
-        buffer["messages"].append(message)
-
-    # Самая важная часть исправления:
-    # при поступлении нового фото отменяем старый таймер
-    # и начинаем ожидание заново.
-    old_task = buffer.get("task")
-
-    if old_task is not None and not old_task.done():
-        old_task.cancel()
-
-    buffer["task"] = asyncio.create_task(
-        process_media_group_after_delay(
-            key,
-            bot
-        )
+    await send_main_menu(
+        message
     )
 
 
-@router.message()
-async def handle_private_fallback(
-    message: Message,
-    bot: Bot
-) -> None:
-
-    if message.chat.type != "private":
-        return
-
-    # Альбом обрабатывается отдельным handler'ом.
-    if message.media_group_id:
-        return
-
-    user_id = message.from_user.id
-    mode = user_mode.get(user_id)
-
-    if mode in {"post", "support"}:
-
-        if mode == "post":
-            banned_until = user_bans.get(user_id)
-
-            now_ts = int(
-                datetime.now(timezone.utc).timestamp()
-            )
-
-            if banned_until and banned_until > now_ts:
-                remaining = banned_until - now_ts
-
-                user_mode.pop(
-                    user_id,
-                    None
-                )
-
-                await message.answer(
-                    f"🚫 Вы были заблокированы в предложке. "
-                    f"Вы будете разблокированы через "
-                    f"{format_remaining(remaining)}",
-                    reply_markup=MAIN_KB,
-                )
-
-                return
-
-            kind = get_message_kind(message)
-
-            if kind not in {
-                "text",
-                "photo",
-                "video"
-            }:
-                await message.answer(
-                    "Отправьте текст, фото или видео.",
-                    reply_markup=CANCEL_KB,
-                )
-
-                return
-
-            try:
-                moderation_message_id, record = await send_submission_to_topic(
-                    bot=bot,
-                    topic_id=POST_CHAT_ID,
-                    user=message.from_user,
-                    source_message=message,
-                    bundle_messages=None,
-                )
-
-            except TelegramBadRequest:
-                logger.exception(
-                    "Failed to send post to group/topic. "
-                    "Check GROUP_ID=%s, POST_CHAT_ID=%s, "
-                    "bot membership and topic access.",
-                    GROUP_ID,
-                    POST_CHAT_ID,
-                )
-
-                await message.answer(
-                    "❌ Не удалось отправить пост в тему.\n"
-                    "Проверь, что бот добавлен в форум-группу, "
-                    "что GROUP_ID верный и что POST_CHAT_ID "
-                    "указывает именно на тему для постов."
-                )
-
-                return
-
-            except Exception:
-                logger.exception(
-                    "Unexpected error while sending post to topic"
-                )
-
-                await message.answer(
-                    "❌ Произошла ошибка при отправке поста.",
-                    reply_markup=MAIN_KB,
-                )
-
-                return
-
-            pending_posts[moderation_message_id] = record
-
-            with contextlib.suppress(Exception):
-                await bot.edit_message_reply_markup(
-                    chat_id=GROUP_ID,
-                    message_id=moderation_message_id,
-                    reply_markup=post_action_kb(),
-                )
-
-            user_mode.pop(
-                user_id,
-                None
-            )
-
-            await message.answer(
-                "<b>✅ Ваш пост принят на рассмотрение</b>\n\n"
-                "Хотите повторно отправить пост или обратиться "
-                "в поддержку канала? Выберите необходимую опцию "
-                "при помощи кнопок ниже.",
-                reply_markup=MAIN_KB,
-            )
-
-            return
-
-        if mode == "support":
-            if user_id in support_banned_users:
-                await message.answer(
-                    "🚫 Вы заблокированы в поддержке."
-                )
-                return
-
-            kind = get_message_kind(message)
-
-            if kind not in {
-                "text",
-                "photo",
-                "video"
-            }:
-                await message.answer(
-                    "Отправьте текст, фото или видео.",
-                    reply_markup=CANCEL_KB,
-                )
-
-                return
-
-            try:
-                copied_ids = await send_support_submission_to_topic(
-                    bot=bot,
-                    topic_id=SUP_CHAT_ID,
-                    user=message.from_user,
-                    source_message=message,
-                    bundle_messages=None,
-                )
-
-            except TelegramBadRequest:
-                logger.exception(
-                    "Failed to send support message to group/topic. "
-                    "Check GROUP_ID=%s, SUP_CHAT_ID=%s, "
-                    "bot membership and topic access.",
-                    GROUP_ID,
-                    SUP_CHAT_ID,
-                )
-
-                await message.answer(
-                    "❌ Не удалось отправить сообщение в поддержку.\n"
-                    "Проверь, что бот добавлен в форум-группу, "
-                    "что GROUP_ID верный и что SUP_CHAT_ID "
-                    "указывает именно на тему поддержки."
-                )
-
-                return
-
-            except Exception:
-                logger.exception(
-                    "Unexpected error while sending support message"
-                )
-
-                await message.answer(
-                    "❌ Произошла ошибка при отправке сообщения.",
-                    reply_markup=CANCEL_KB
-                )
-
-                return
-
-            for copied_id in copied_ids:
-                support_message_to_user[
-                    copied_id
-                ] = user_id
-
-            await message.answer(
-                "✅ Ваше обращение было передано в поддержку."
-            )
-
-            return
-
-    # Not in any mode: behave like /start
-    user_mode.pop(
-        user_id,
-        None
-    )
-
-    await send_main_menu(message)
-
-
-@router.callback_query(F.data == "post:accept")
-async def cb_post_accept(
-    callback: CallbackQuery,
-    bot: Bot
-) -> None:
-
-    msg = callback.message
-
-    if not msg:
-        await callback.answer()
-        return
-
-    record = pending_posts.pop(
-        msg.message_id,
-        None
-    )
-
-    if not record:
-        await callback.answer(
-            "Пост уже обработан",
-            show_alert=True
-        )
-        return
-
-    body = record["body"]
-    admin_link = admin_mention_html(
-        callback.from_user
-    )
-
-    status_line = f"✅ Принято: {admin_link}"
-    include_body = record.get("kind") != "album"
-
-    with contextlib.suppress(Exception):
-        await edit_topic_message_with_status(
-            bot,
-            msg,
-            status_line,
-            body,
-            include_body=include_body
-        )
-
-    with contextlib.suppress(Exception):
-        await publish_post_to_channel(
-            bot,
-            record
-        )
-
-    await callback.answer(
-        "Принято"
-    )
-
-
-@router.callback_query(F.data == "post:reject")
-async def cb_post_reject(
-    callback: CallbackQuery,
-    bot: Bot
-) -> None:
-
-    msg = callback.message
-
-    if not msg:
-        await callback.answer()
-        return
-
-    record = pending_posts.pop(
-        msg.message_id,
-        None
-    )
-
-    if not record:
-        await callback.answer(
-            "Пост уже обработан",
-            show_alert=True
-        )
-        return
-
-    body = record["body"]
-    admin_link = admin_mention_html(
-        callback.from_user
-    )
-
-    status_line = f"❌ Отклонено: {admin_link}"
-    include_body = record.get("kind") != "album"
-
-    with contextlib.suppress(Exception):
-        await edit_topic_message_with_status(
-            bot,
-            msg,
-            status_line,
-            body,
-            include_body=include_body
-        )
-
-    await callback.answer(
-        "Отклонено"
-    )
-
-
-@router.callback_query(F.data == "post:ban_menu")
-async def cb_post_ban_menu(
-    callback: CallbackQuery,
-    bot: Bot
-) -> None:
-
-    msg = callback.message
-
-    if not msg:
-        await callback.answer()
-        return
-
-    if msg.message_id not in pending_posts:
-        await callback.answer(
-            "Пост уже обработан",
-            show_alert=True
-        )
-        return
-
-    with contextlib.suppress(Exception):
-        await bot.edit_message_reply_markup(
-            chat_id=msg.chat.id,
-            message_id=msg.message_id,
-            reply_markup=ban_menu_kb(),
-        )
-
-    await callback.answer()
-
-
-@router.callback_query(F.data == "post:back")
-async def cb_post_back(
-    callback: CallbackQuery,
-    bot: Bot
-) -> None:
-
-    msg = callback.message
-
-    if not msg:
-        await callback.answer()
-        return
-
-    if msg.message_id not in pending_posts:
-        await callback.answer(
-            "Пост уже обработан",
-            show_alert=True
-        )
-        return
-
-    with contextlib.suppress(Exception):
-        await bot.edit_message_reply_markup(
-            chat_id=msg.chat.id,
-            message_id=msg.message_id,
-            reply_markup=post_action_kb(),
-        )
-
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("ban:"))
-async def cb_post_ban_duration(
-    callback: CallbackQuery,
-    bot: Bot
-) -> None:
-
-    msg = callback.message
-
-    if not msg:
-        await callback.answer()
-        return
-
-    record = pending_posts.pop(
-        msg.message_id,
-        None
-    )
-
-    if not record:
-        await callback.answer(
-            "Пост уже обработан",
-            show_alert=True
-        )
-        return
-
-    try:
-        seconds = int(
-            callback.data.split(":", 1)[1]
-        )
-
-    except Exception:
-        await callback.answer(
-            "Ошибка",
-            show_alert=True
-        )
-        return
-
-    user_id = record["user_id"]
-
-    banned_until = (
-        int(
-            datetime.now(timezone.utc).timestamp()
-        )
-        + seconds
-    )
-
-    user_bans[user_id] = banned_until
-
-    label = BAN_LABEL_BY_SECONDS.get(
-        seconds,
-        "время"
-    )
-
-    admin_link = admin_mention_html(
-        callback.from_user
-    )
-
-    status_line = (
-        f"🚫 Бан на {label}: {admin_link}"
-    )
-
-    include_body = record.get("kind") != "album"
-
-    with contextlib.suppress(Exception):
-        await edit_topic_message_with_status(
-            bot,
-            msg,
-            status_line,
-            record["body"],
-            include_body=include_body
-        )
-
-    await callback.answer(
-        f"Пользователь заблокирован на {label}"
-    )
-
+# ============================================================
+# SUPPORT TOPIC
+# ============================================================
 
 @router.message(
     F.chat.id == GROUP_ID,
@@ -1605,14 +1554,628 @@ async def handle_support_commands_and_replies(
         )
 
 
+# ============================================================
+# MEDIA GROUP HANDLER
+# ============================================================
+
+@router.message(
+    F.media_group_id
+)
+async def handle_media_group_item(
+    message: Message,
+    bot: Bot
+) -> None:
+
+    if get_message_kind(message) not in {
+        "photo",
+        "video"
+    }:
+        return
+
+    key = (
+        message.chat.id,
+        message.media_group_id
+    )
+
+    buffer = media_group_buffers.get(
+        key
+    )
+
+    if buffer is None:
+        buffer = {
+            "messages": [],
+            "task": None,
+        }
+
+        media_group_buffers[key] = buffer
+
+    existing_ids = {
+        msg.message_id
+        for msg in buffer["messages"]
+    }
+
+    if message.message_id not in existing_ids:
+        buffer["messages"].append(
+            message
+        )
+
+    # Каждый новый элемент переносит момент обработки.
+    old_task = buffer.get(
+        "task"
+    )
+
+    if old_task is not None and not old_task.done():
+        old_task.cancel()
+
+    buffer["task"] = asyncio.create_task(
+        process_media_group_after_delay(
+            key,
+            bot
+        )
+    )
+
+
+# ============================================================
+# PRIVATE FALLBACK
+# ============================================================
+
+@router.message()
+async def handle_private_fallback(
+    message: Message,
+    bot: Bot
+) -> None:
+
+    if message.chat.type != "private":
+        return
+
+    # Альбом отдельно обрабатывается handle_media_group_item.
+    if message.media_group_id:
+        return
+
+    user_id = message.from_user.id
+    mode = user_mode.get(
+        user_id
+    )
+
+    # ========================================================
+    # АКТИВНАЯ ПРЕДЛОЖКА
+    # ========================================================
+
+    if mode == "post":
+
+        banned_until = user_bans.get(
+            user_id
+        )
+
+        now_ts = int(
+            datetime.now(timezone.utc).timestamp()
+        )
+
+        if banned_until and banned_until > now_ts:
+            remaining = (
+                banned_until - now_ts
+            )
+
+            user_mode.pop(
+                user_id,
+                None
+            )
+
+            await message.answer(
+                "🚫 Вы были заблокированы в предложке. "
+                f"Вы будете разблокированы через "
+                f"{format_remaining(remaining)}",
+                reply_markup=MAIN_KB,
+            )
+
+            return
+
+        kind = get_message_kind(
+            message
+        )
+
+        if kind not in {
+            "text",
+            "photo",
+            "video"
+        }:
+            await message.answer(
+                "Отправьте текст, фото или видео.",
+                reply_markup=CANCEL_KB,
+            )
+
+            return
+
+        try:
+            moderation_message_id, record = (
+                await send_submission_to_topic(
+                    bot=bot,
+                    topic_id=POST_CHAT_ID,
+                    user=message.from_user,
+                    source_message=message,
+                    bundle_messages=None,
+                )
+            )
+
+        except TelegramBadRequest:
+            logger.exception(
+                "Failed to send post to group/topic. "
+                "Check GROUP_ID=%s, POST_CHAT_ID=%s, "
+                "bot membership and topic access.",
+                GROUP_ID,
+                POST_CHAT_ID,
+            )
+
+            await message.answer(
+                "❌ Не удалось отправить пост в тему.\n"
+                "Проверь, что бот добавлен в форум-группу, "
+                "что GROUP_ID верный и что POST_CHAT_ID "
+                "указывает именно на тему для постов."
+            )
+
+            return
+
+        except Exception:
+            logger.exception(
+                "Unexpected error while sending post to topic"
+            )
+
+            await message.answer(
+                "❌ Произошла ошибка при отправке поста.",
+                reply_markup=MAIN_KB,
+            )
+
+            return
+
+        pending_posts[
+            moderation_message_id
+        ] = record
+
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=GROUP_ID,
+                message_id=moderation_message_id,
+                reply_markup=post_action_kb(),
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to add moderation keyboard "
+                "to message_id=%s",
+                moderation_message_id,
+            )
+
+            pending_posts.pop(
+                moderation_message_id,
+                None
+            )
+
+            await message.answer(
+                "❌ Не удалось добавить кнопки управления "
+                "к предложенному посту.",
+                reply_markup=MAIN_KB,
+            )
+
+            return
+
+        user_mode.pop(
+            user_id,
+            None
+        )
+
+        await message.answer(
+            "<b>✅ Ваш пост принят на рассмотрение</b>\n\n"
+            "Хотите повторно отправить пост или обратиться "
+            "в поддержку канала? Выберите необходимую опцию "
+            "при помощи кнопок ниже.",
+            reply_markup=MAIN_KB,
+        )
+
+        return
+
+    # ========================================================
+    # АКТИВНАЯ ПОДДЕРЖКА
+    # ========================================================
+
+    if mode == "support":
+
+        if user_id in support_banned_users:
+            await message.answer(
+                "🚫 Вы заблокированы в поддержке."
+            )
+            return
+
+        kind = get_message_kind(
+            message
+        )
+
+        if kind not in {
+            "text",
+            "photo",
+            "video"
+        }:
+            await message.answer(
+                "Отправьте текст, фото или видео.",
+                reply_markup=CANCEL_KB,
+            )
+
+            return
+
+        try:
+            copied_ids = (
+                await send_support_submission_to_topic(
+                    bot=bot,
+                    topic_id=SUP_CHAT_ID,
+                    user=message.from_user,
+                    source_message=message,
+                    bundle_messages=None,
+                )
+            )
+
+        except TelegramBadRequest:
+            logger.exception(
+                "Failed to send support message to group/topic. "
+                "Check GROUP_ID=%s, SUP_CHAT_ID=%s, "
+                "bot membership and topic access.",
+                GROUP_ID,
+                SUP_CHAT_ID,
+            )
+
+            await message.answer(
+                "❌ Не удалось отправить сообщение в поддержку.\n"
+                "Проверь, что бот добавлен в форум-группу, "
+                "что GROUP_ID верный и что SUP_CHAT_ID "
+                "указывает именно на тему поддержки."
+            )
+
+            return
+
+        except Exception:
+            logger.exception(
+                "Unexpected error while sending support message"
+            )
+
+            await message.answer(
+                "❌ Произошла ошибка при отправке сообщения.",
+                reply_markup=CANCEL_KB
+            )
+
+            return
+
+        for copied_id in copied_ids:
+            support_message_to_user[
+                copied_id
+            ] = user_id
+
+        await message.answer(
+            "✅ Ваше обращение было передано в поддержку."
+        )
+
+        return
+
+    # ========================================================
+    # НЕТ АКТИВНОГО РЕЖИМА
+    # ========================================================
+
+    # Ничего пользователю не отвечаем.
+    # Просто молча копируем его сообщение в PRIKOL_CHAT_ID.
+    await send_message_silently_to_prikol(
+        bot,
+        message
+    )
+
+
+# ============================================================
+# MODERATION: ACCEPT
+# ============================================================
+
+@router.callback_query(
+    F.data == "post:accept"
+)
+async def cb_post_accept(
+    callback: CallbackQuery,
+    bot: Bot
+) -> None:
+
+    msg = callback.message
+
+    if not msg:
+        await callback.answer()
+        return
+
+    record = pending_posts.pop(
+        msg.message_id,
+        None
+    )
+
+    if not record:
+        await callback.answer(
+            "Пост уже обработан",
+            show_alert=True
+        )
+        return
+
+    body = record["body"]
+
+    admin_link = admin_mention_html(
+        callback.from_user
+    )
+
+    status_line = (
+        f"✅ Принято: {admin_link}"
+    )
+
+    include_body = (
+        record.get("kind") != "album"
+    )
+
+    try:
+        await edit_topic_message_with_status(
+            bot,
+            msg,
+            status_line,
+            body,
+            include_body=include_body
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to edit moderation message "
+            "for accepted post"
+        )
+
+    try:
+        await publish_post_to_channel(
+            bot,
+            record
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to publish accepted post "
+            "to channel"
+        )
+
+    await callback.answer(
+        "Принято"
+    )
+
+
+# ============================================================
+# MODERATION: REJECT
+# ============================================================
+
+@router.callback_query(
+    F.data == "post:reject"
+)
+async def cb_post_reject(
+    callback: CallbackQuery,
+    bot: Bot
+) -> None:
+
+    msg = callback.message
+
+    if not msg:
+        await callback.answer()
+        return
+
+    record = pending_posts.pop(
+        msg.message_id,
+        None
+    )
+
+    if not record:
+        await callback.answer(
+            "Пост уже обработан",
+            show_alert=True
+        )
+        return
+
+    body = record["body"]
+
+    admin_link = admin_mention_html(
+        callback.from_user
+    )
+
+    status_line = (
+        f"❌ Отклонено: {admin_link}"
+    )
+
+    include_body = (
+        record.get("kind") != "album"
+    )
+
+    with contextlib.suppress(Exception):
+        await edit_topic_message_with_status(
+            bot,
+            msg,
+            status_line,
+            body,
+            include_body=include_body
+        )
+
+    await callback.answer(
+        "Отклонено"
+    )
+
+
+# ============================================================
+# MODERATION: BAN MENU
+# ============================================================
+
+@router.callback_query(
+    F.data == "post:ban_menu"
+)
+async def cb_post_ban_menu(
+    callback: CallbackQuery,
+    bot: Bot
+) -> None:
+
+    msg = callback.message
+
+    if not msg:
+        await callback.answer()
+        return
+
+    if msg.message_id not in pending_posts:
+        await callback.answer(
+            "Пост уже обработан",
+            show_alert=True
+        )
+        return
+
+    with contextlib.suppress(Exception):
+        await bot.edit_message_reply_markup(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            reply_markup=ban_menu_kb(),
+        )
+
+    await callback.answer()
+
+
+# ============================================================
+# MODERATION: BACK
+# ============================================================
+
+@router.callback_query(
+    F.data == "post:back"
+)
+async def cb_post_back(
+    callback: CallbackQuery,
+    bot: Bot
+) -> None:
+
+    msg = callback.message
+
+    if not msg:
+        await callback.answer()
+        return
+
+    if msg.message_id not in pending_posts:
+        await callback.answer(
+            "Пост уже обработан",
+            show_alert=True
+        )
+        return
+
+    with contextlib.suppress(Exception):
+        await bot.edit_message_reply_markup(
+            chat_id=msg.chat.id,
+            message_id=msg.message_id,
+            reply_markup=post_action_kb(),
+        )
+
+    await callback.answer()
+
+
+# ============================================================
+# MODERATION: BAN
+# ============================================================
+
+@router.callback_query(
+    F.data.startswith("ban:")
+)
+async def cb_post_ban_duration(
+    callback: CallbackQuery,
+    bot: Bot
+) -> None:
+
+    msg = callback.message
+
+    if not msg:
+        await callback.answer()
+        return
+
+    record = pending_posts.pop(
+        msg.message_id,
+        None
+    )
+
+    if not record:
+        await callback.answer(
+            "Пост уже обработан",
+            show_alert=True
+        )
+        return
+
+    try:
+        seconds = int(
+            callback.data.split(
+                ":",
+                1
+            )[1]
+        )
+
+    except Exception:
+        await callback.answer(
+            "Ошибка",
+            show_alert=True
+        )
+        return
+
+    user_id = record["user_id"]
+
+    banned_until = (
+        int(
+            datetime.now(timezone.utc).timestamp()
+        )
+        + seconds
+    )
+
+    user_bans[
+        user_id
+    ] = banned_until
+
+    label = BAN_LABEL_BY_SECONDS.get(
+        seconds,
+        "время"
+    )
+
+    admin_link = admin_mention_html(
+        callback.from_user
+    )
+
+    status_line = (
+        f"🚫 Бан на {label}: {admin_link}"
+    )
+
+    include_body = (
+        record.get("kind") != "album"
+    )
+
+    with contextlib.suppress(Exception):
+        await edit_topic_message_with_status(
+            bot,
+            msg,
+            status_line,
+            record["body"],
+            include_body=include_body
+        )
+
+    await callback.answer(
+        f"Пользователь заблокирован на {label}"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
 async def main() -> None:
+
     logger.info(
-        "Starting bot with GROUP_ID=%s "
-        "POST_CHAT_ID=%s SUP_CHAT_ID=%s CHANNEL_ID=%s",
+        "Starting bot with "
+        "GROUP_ID=%s "
+        "POST_CHAT_ID=%s "
+        "SUP_CHAT_ID=%s "
+        "CHANNEL_ID=%s "
+        "PRIKOL_CHAT_ID=%s",
         GROUP_ID,
         POST_CHAT_ID,
         SUP_CHAT_ID,
         CHANNEL_ID,
+        PRIKOL_CHAT_ID,
     )
 
     bot = Bot(
@@ -1623,12 +2186,17 @@ async def main() -> None:
     )
 
     dp = Dispatcher()
-    dp.include_router(router)
+
+    dp.include_router(
+        router
+    )
 
     runner = await start_web_server()
 
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(
+            bot
+        )
 
     finally:
         await runner.cleanup()
