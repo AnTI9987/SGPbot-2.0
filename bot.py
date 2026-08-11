@@ -257,6 +257,19 @@ async def start_web_server() -> web.AppRunner:
     return runner
 
 
+async def send_moderation_control_message(bot: Bot, topic_id: int) -> int:
+    # Must be real, visible, non-empty text - Telegram rejects a message
+    # whose text is only an invisible/placeholder character as empty.
+    control = await bot.send_message(
+        chat_id=GROUP_ID,
+        message_thread_id=topic_id,
+        text="📋 Управление постом",
+        reply_markup=post_action_kb(),
+        link_preview_options=NO_PREVIEW,
+    )
+    return extract_message_id(control)
+
+
 async def send_submission_single_to_topic(
     bot: Bot,
     topic_id: int,
@@ -365,23 +378,17 @@ async def send_submission_album_to_topic(
                 body = m.caption
                 break
 
-        # NOTE: we used to send a *separate* control message here containing
-        # only an invisible placeholder character ("ㅤ") just to hang the
-        # moderation buttons on. Telegram can reject a sendMessage whose text
-        # resolves to nothing visible with "Bad Request: message text is
-        # empty" - and since that call happened *after* the album was already
-        # copied, the album would show up in the admin chat with no buttons
-        # and the user would still get an error. Instead, attach the buttons
-        # directly to the first already-copied photo/video (same approach
-        # used for single-item posts below), so there's no extra message and
-        # nothing for Telegram to reject as "empty".
-        control_message_id = copied_ids[0]
-        with contextlib.suppress(Exception):
-            await bot.edit_message_reply_markup(
-                chat_id=GROUP_ID,
-                message_id=control_message_id,
-                reply_markup=post_action_kb(),
-            )
+        # Telegram does not attach/render inline keyboards on individual
+        # items of a media group/album - editMessageReplyMarkup on one of
+        # the copied album items is accepted without error but the keyboard
+        # simply never shows up. So the moderation buttons must live on a
+        # separate, standalone message outside the album.
+        #
+        # (An earlier version of this used a message whose text was only an
+        # invisible placeholder character, which Telegram rejects outright
+        # with "Bad Request: message text is empty" - that's a different bug
+        # this control message must also avoid by using real, visible text.)
+        control_message_id = await send_moderation_control_message(bot, topic_id)
 
         record = {
             "kind": "album",
@@ -866,9 +873,13 @@ async def cb_post_accept(callback: CallbackQuery, bot: Bot) -> None:
     body = record["body"]
     admin_link = admin_mention_html(callback.from_user)
     status_line = f"✅ Принято: {admin_link}"
+    # Albums use a standalone control message that never contained the post
+    # body (the body/caption lives on the album items themselves), so don't
+    # duplicate it there.
+    include_body = record.get("kind") != "album"
 
     with contextlib.suppress(Exception):
-        await edit_topic_message_with_status(bot, msg, status_line, body)
+        await edit_topic_message_with_status(bot, msg, status_line, body, include_body=include_body)
 
     with contextlib.suppress(Exception):
         await publish_post_to_channel(bot, record)
@@ -891,9 +902,10 @@ async def cb_post_reject(callback: CallbackQuery, bot: Bot) -> None:
     body = record["body"]
     admin_link = admin_mention_html(callback.from_user)
     status_line = f"❌ Отклонено: {admin_link}"
+    include_body = record.get("kind") != "album"
 
     with contextlib.suppress(Exception):
-        await edit_topic_message_with_status(bot, msg, status_line, body)
+        await edit_topic_message_with_status(bot, msg, status_line, body, include_body=include_body)
 
     await callback.answer("Отклонено")
 
@@ -965,9 +977,10 @@ async def cb_post_ban_duration(callback: CallbackQuery, bot: Bot) -> None:
     label = BAN_LABEL_BY_SECONDS.get(seconds, "время")
     admin_link = admin_mention_html(callback.from_user)
     status_line = f"🚫 Бан на {label}: {admin_link}"
+    include_body = record.get("kind") != "album"
 
     with contextlib.suppress(Exception):
-        await edit_topic_message_with_status(bot, msg, status_line, record["body"])
+        await edit_topic_message_with_status(bot, msg, status_line, record["body"], include_body=include_body)
 
     await callback.answer(f"Пользователь заблокирован на {label}")
 
